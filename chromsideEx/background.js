@@ -41,4 +41,5 @@ async function fetchSuggestion({ message, contactName, chatHistory, model, syste
 
   const data = await response.json();
   return data.reply;
+
 }

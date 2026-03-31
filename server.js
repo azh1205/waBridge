@@ -10,7 +10,7 @@ import cors from "cors";
 const PORT = process.env.PORT || 3000;
 const LM_URL = process.env.LM_STUDIO_URL || "http://localhost:1234";
 const LM_API_KEY = process.env.LM_API_KEY || "";
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "qwen3.5-9b";
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "phi-3.1-mini-4k-instruct";
 
 const DEFAULT_SYSTEM_PROMPT =
   "You are a helpful WhatsApp assistant. " +
@@ -50,8 +50,8 @@ app.get("/status", (_req, res) => {
     bridge: "running",
     port: PORT,
     lmStudio: LM_URL,
-    endpoint: `${LM_URL}/api/v1/chat`,
-    mcpPlugins: MCP_PLUGINS,
+    endpoint: `${LM_URL}/v1/chat/completions`,
+    mcpPlugins: "disabled",
     defaultModel: DEFAULT_MODEL,
   });
 });
@@ -89,8 +89,8 @@ app.listen(PORT, () => {
 ╠══════════════════════════════════════════════╣
 ║  Bridge   : http://localhost:${PORT}              ║
 ║  LM Studio: ${LM_URL}
-║  Endpoint : /api/v1/chat                     ║
-║  Plugins  : ${MCP_PLUGINS.length} MCP servers attached           ║
+║  Endpoint : /v1/chat/completions             ║
+║  MCP      : disabled (direct LLM mode)       ║
 ╚══════════════════════════════════════════════╝
   `);
 });
@@ -113,21 +113,21 @@ async function generateReply({ message, contactName, chatHistory, model, systemP
     `\nWrite a natural, brief WhatsApp reply on my behalf.`,
   ].filter(Boolean).join("\n");
 
-  // Build MCP plugin integrations for LM Studio
-  const integrations = MCP_PLUGINS.map((id) => ({ type: "plugin", id }));
-
+  // Build standard OpenAI-compatible chat payload (no MCP plugins needed)
   const payload = {
     model,
-    input,
-    system_prompt: systemPrompt,
-    integrations,
-    context_length: 8000,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: input },
+    ],
     temperature: 0.7,
+    max_tokens: 512,
+    stream: false,
   };
 
-  console.log(`[Bridge] → POST ${LM_URL}/api/v1/chat (model: ${model})`);
+  console.log(`[Bridge] → POST ${LM_URL}/v1/chat/completions (model: ${model})`);
 
-  const data = await lmFetch("POST", "/api/v1/chat", payload);
+  const data = await lmFetch("POST", "/v1/chat/completions", payload);
 
   // LM Studio /api/v1/chat response shapes:
   const reply =
