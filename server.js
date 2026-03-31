@@ -10,7 +10,7 @@ import cors from "cors";
 const PORT = process.env.PORT || 3000;
 const LM_URL = process.env.LM_STUDIO_URL || "http://localhost:1234";
 const LM_API_KEY = process.env.LM_API_KEY || "";
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "phi-3.1-mini-4k-instruct";
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "qwen3.5-9b";
 
 const DEFAULT_SYSTEM_PROMPT =
   "You are a helpful WhatsApp assistant. " +
@@ -62,7 +62,7 @@ app.post("/suggest", async (req, res) => {
     message,
     contactName = "Contact",
     chatHistory = [],
-    model = "phi-3.1-mini-4k-instruct",
+    model = DEFAULT_MODEL,
     systemPrompt = DEFAULT_SYSTEM_PROMPT,
   } = req.body;
 
