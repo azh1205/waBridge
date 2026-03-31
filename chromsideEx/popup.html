@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>WA LLM Settings</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 300px;
+      background: #1a1a2e;
+      color: #e2e8f0;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 13px;
+    }
+    .header {
+      padding: 16px;
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: 0.3px;
+    }
+    .header small {
+      display: block;
+      font-weight: 400;
+      font-size: 11px;
+      opacity: 0.8;
+      margin-top: 2px;
+    }
+    .body { padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+    label { display: block; font-size: 11px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; }
+    input, textarea, select {
+      width: 100%;
+      background: #16213e;
+      border: 1px solid #2d2d4e;
+      border-radius: 8px;
+      padding: 8px 10px;
+      color: #e2e8f0;
+      font-size: 13px;
+      outline: none;
+      font-family: inherit;
+    }
+    input:focus, textarea:focus, select:focus {
+      border-color: #6366f1;
+      box-shadow: 0 0 0 2px rgba(99,102,241,0.2);
+    }
+    textarea { resize: vertical; min-height: 70px; }
+    .hint { font-size: 11px; color: #475569; margin-top: 4px; }
+    .status {
+      font-size: 12px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      display: none;
+    }
+    .status.ok { background: #14532d; color: #86efac; display: block; }
+    .status.err { background: #450a0a; color: #fca5a5; display: block; }
+    button {
+      width: 100%;
+      padding: 10px;
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    button:hover { opacity: 0.9; }
+    .server-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #64748b;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #475569; }
+    .dot.online { background: #22c55e; }
+    .dot.offline { background: #ef4444; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    ⚡ WA LLM Assistant
+    <small>Powered by LM Studio</small>
+  </div>
+  <div class="body">
+    <div>
+      <label>MCP Server Status</label>
+      <div class="server-status">
+        <div class="dot" id="server-dot"></div>
+        <span id="server-label">Checking...</span>
+      </div>
+    </div>
+    <div>
+      <label>Trigger Keywords</label>
+      <input type="text" id="keywords" placeholder="help, support, halo, info" />
+      <div class="hint">Comma-separated. Reply suggestions trigger when any keyword is detected.</div>
+    </div>
+    <div>
+      <label>Model Name</label>
+      <input type="text" id="model" placeholder="local-model" />
+      <div class="hint">Match the model name from LM Studio (e.g. llama-3.2-3b-instruct)</div>
+    </div>
+    <div>
+      <label>System Prompt</label>
+      <textarea id="systemPrompt" placeholder="You are a helpful WhatsApp assistant. Reply concisely and naturally."></textarea>
+    </div>
+    <div id="status" class="status"></div>
+    <button id="save">Save Settings</button>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
