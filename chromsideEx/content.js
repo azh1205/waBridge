@@ -1,72 +1,156 @@
 // content.js — Injected into web.whatsapp.com
-// Monitors incoming messages, matches keywords, shows suggestion panel
+// Monitors chat messages, matches keywords, shows suggestion panel
+
+console.log("[WA-LLM] Content script successfully loaded. Waiting for WhatsApp UI...");
 
 let settings = { keywords: [], model: "local-model", systemPrompt: "" };
-let lastProcessedMsgId = null;
+let lastProcessedSignature = null;
 let suggestionPanel = null;
 let isProcessing = false;
+
+// ─── Extension health check ───────────────────────────────────────────────────
+
+function isExtensionValid() {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ type: "PING" }, () => {
+        resolve(!chrome.runtime.lastError);
+      });
+      setTimeout(() => resolve(false), 1000);
+    } catch (e) {
+      resolve(false);
+    }
+  });
+}
 
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 async function init() {
-  settings = await getSettings();
+  console.log("[WA-LLM] Starting initialization sequence...");
+
+  // Check extension is still alive before proceeding
+  const alive = await isExtensionValid();
+  if (!alive) {
+    console.warn("[WA-LLM] Extension disconnected, reloading page...");
+    window.location.reload();
+    return;
+  }
+
+  try {
+    settings = await getSettings();
+    settings.keywords = normalizeKeywords(settings.keywords);
+    console.log("[WA-LLM] Settings loaded.", settings);
+  } catch (err) {
+    console.error("[WA-LLM] Failed to load settings, using defaults.", err);
+    settings = {
+      keywords: ["help", "support", "info", "halo", "hai"],
+      model: "local-model",
+      systemPrompt: "",
+    };
+    settings.keywords = normalizeKeywords(settings.keywords);
+  }
+
   injectPanel();
   observeChat();
-  console.log("[WA-LLM] Extension active. Keywords:", settings.keywords);
+  console.log("[WA-LLM] Extension active. Listening for keywords:", settings.keywords);
+  console.log("[WA-LLM] Normalized keywords:", settings.keywords.join(", "));
 }
 
 function getSettings() {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: "GET_SETTINGS" }, resolve);
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timeout waiting for background script")), 3000);
+
+    chrome.runtime.sendMessage({ type: "GET_SETTINGS" }, (res) => {
+      clearTimeout(timeout);
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve(res);
+      }
+    });
   });
 }
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "sync") return;
+
+  if (changes.keywords) {
+    settings.keywords = normalizeKeywords(changes.keywords.newValue);
+  }
+  if (changes.model) {
+    settings.model = changes.model.newValue || "local-model";
+  }
+  if (changes.systemPrompt) {
+    settings.systemPrompt = changes.systemPrompt.newValue || "";
+  }
+
+  console.log("[WA-LLM] Settings updated live:", settings);
+});
 
 // ─── DOM Observer ─────────────────────────────────────────────────────────────
 
 function observeChat() {
+  let debounceTimer = null;
   const observer = new MutationObserver(() => {
-    checkLatestMessage();
+    // Debounce: wait for DOM to settle before checking (WhatsApp mutates constantly)
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(checkLatestMessage, 300);
   });
-
-  // Watch for new chat messages
-  const targetNode = document.body;
-  observer.observe(targetNode, { childList: true, subtree: true });
+  observer.observe(document.body, { childList: true, subtree: true });
 }
 
 function checkLatestMessage() {
   if (isProcessing) return;
 
-  // WhatsApp Web: incoming messages have data-id and no "out" class
-  const allMessages = document.querySelectorAll('[data-id]');
-  if (!allMessages.length) return;
+  const latestMessage = getLatestMessageNode();
+  if (!latestMessage) return;
 
-  // Find the last incoming message
-  let lastIncoming = null;
-  for (const el of allMessages) {
-    const isOutgoing = el.closest('[class*="message-out"]') !== null;
-    if (!isOutgoing) lastIncoming = el;
-  }
+  processMessageNode(latestMessage);
+}
 
-  if (!lastIncoming) return;
-
-  const msgId = lastIncoming.getAttribute("data-id");
-  if (msgId === lastProcessedMsgId) return;
-
-  // Get text content
-  const textEl = lastIncoming.querySelector("span.selectable-text");
-  if (!textEl) return;
-
-  const messageText = textEl.innerText?.trim();
-  if (!messageText) return;
-
-  // Check if any keyword matches
-  const matched = settings.keywords.some((kw) =>
-    messageText.toLowerCase().includes(kw.toLowerCase())
+function getLatestMessageNode() {
+  const messageNodes = Array.from(
+    document.querySelectorAll('[data-id], div[class*="message-in"], div[class*="message-out"]')
   );
 
-  if (!matched) return;
+  for (let i = messageNodes.length - 1; i >= 0; i -= 1) {
+    const node = messageNodes[i];
+    if (extractMessageText(node)) {
+      return node;
+    }
+  }
 
-  lastProcessedMsgId = msgId;
+  return null;
+}
+
+function processMessageNode(node) {
+  // data-id may be on the node itself, a parent, or a child — walk all three before giving up
+  const msgId =
+    node.getAttribute("data-id") ||
+    node.closest("[data-id]")?.getAttribute("data-id") ||
+    node.querySelector("[data-id]")?.getAttribute("data-id");
+
+  const messageText = extractMessageText(node);
+  if (!messageText) return;
+
+  const signature = `${msgId || "no-id"}::${messageText}`;
+  if (signature === lastProcessedSignature) return;
+
+  const direction = node.closest('[class*="message-out"]') ? "outgoing" : "incoming";
+  console.log(`[WA-LLM] Captured ${direction} message: "${messageText.substring(0, 50)}"`);
+
+  const matched = settings.keywords.some((kw) =>
+    messageText.toLowerCase().includes(kw)
+  );
+
+  if (!matched) {
+    console.log(`[WA-LLM] No keyword match. Keywords:`, settings.keywords);
+    lastProcessedSignature = signature;
+    return;
+  }
+
+  console.log(`[WA-LLM] Keyword matched! Triggering LLM...`);
+  lastProcessedSignature = signature;
   handleKeywordMatch(messageText);
 }
 
@@ -74,7 +158,6 @@ async function handleKeywordMatch(messageText) {
   isProcessing = true;
   showPanel("thinking");
 
-  // Collect last few messages as chat history
   const chatHistory = collectChatHistory();
   const contactName = getContactName();
 
@@ -90,12 +173,17 @@ async function handleKeywordMatch(messageText) {
       },
     },
     (response) => {
-      isProcessing = false;
+      if (chrome.runtime.lastError) {
+        showPanel("error", chrome.runtime.lastError.message);
+        isProcessing = false; // release lock AFTER panel update to block observer re-trigger
+        return;
+      }
       if (response?.ok) {
         showPanel("suggestion", response.reply);
       } else {
         showPanel("error", response?.error || "Unknown error");
       }
+      isProcessing = false; // release lock AFTER panel update to block observer re-trigger
     }
   );
 }
@@ -104,14 +192,12 @@ async function handleKeywordMatch(messageText) {
 
 function collectChatHistory() {
   const history = [];
-  const messages = document.querySelectorAll('[data-id]');
-  const recent = Array.from(messages).slice(-10); // last 10 messages
+  const messages = document.querySelectorAll('[data-id], div[class*="message-in"], div[class*="message-out"]');
+  const recent = Array.from(messages).slice(-10);
 
   for (const el of recent) {
     const isOutgoing = el.closest('[class*="message-out"]') !== null;
-    const textEl = el.querySelector("span.selectable-text");
-    if (!textEl) continue;
-    const text = textEl.innerText?.trim();
+    const text = extractMessageText(el);
     if (!text) continue;
     history.push({ role: isOutgoing ? "assistant" : "user", content: text });
   }
@@ -120,7 +206,9 @@ function collectChatHistory() {
 }
 
 function getContactName() {
-  const header = document.querySelector('[data-testid="conversation-header"] [data-testid="conversation-info-header-chat-title"]');
+  const header = document.querySelector(
+    '[data-testid="conversation-header"] [data-testid="conversation-info-header-chat-title"]'
+  );
   return header?.innerText?.trim() || "Contact";
 }
 
@@ -151,12 +239,11 @@ function injectPanel() {
     suggestionPanel.classList.add("wa-llm-hidden");
   });
 
-  document.getElementById("wa-llm-send")?.addEventListener("click", sendSuggestion);
-  document.getElementById("wa-llm-regen")?.addEventListener("click", regenerate);
+  document.getElementById("wa-llm-send").addEventListener("click", sendSuggestion);
+  document.getElementById("wa-llm-regen").addEventListener("click", regenerate);
 }
 
 let currentSuggestion = "";
-let lastMessage = "";
 
 function showPanel(state, content = "") {
   if (!suggestionPanel) injectPanel();
@@ -172,9 +259,7 @@ function showPanel(state, content = "") {
     currentSuggestion = content;
     body.innerHTML = `<div class="wa-llm-suggestion" contenteditable="true" id="wa-llm-text">${escapeHtml(content)}</div>`;
     footer.style.display = "flex";
-    // Re-bind send since DOM was replaced
-    document.getElementById("wa-llm-send").addEventListener("click", sendSuggestion);
-    document.getElementById("wa-llm-regen").addEventListener("click", regenerate);
+    // Note: Send/Regen listeners are already attached once in injectPanel() — don't re-add here
   } else if (state === "error") {
     body.innerHTML = `<div class="wa-llm-error">⚠ ${escapeHtml(content)}</div>`;
     footer.style.display = "none";
@@ -187,25 +272,23 @@ function sendSuggestion() {
   if (!text) return;
 
   injectTextIntoInput(text);
-  showPanel("idle");
   document.getElementById("wa-llm-footer").style.display = "none";
   document.getElementById("wa-llm-body").innerHTML = `<div class="wa-llm-idle">✓ Sent! Waiting for next keyword...</div>`;
 }
 
 function regenerate() {
-  if (!lastProcessedMsgId) return;
-  const textEl = document.querySelector(`[data-id="${lastProcessedMsgId}"] span.selectable-text`);
-  const msg = textEl?.innerText?.trim();
+  const latestMessage = getLatestMessageNode();
+  const msg = latestMessage ? extractMessageText(latestMessage) : "";
   if (msg) handleKeywordMatch(msg);
 }
 
 // ─── WhatsApp Input Injection ─────────────────────────────────────────────────
 
 function injectTextIntoInput(text) {
-  // Find the main message input box
-  const input = document.querySelector('[data-testid="conversation-compose-box-input"]') ||
-                document.querySelector('div[contenteditable="true"][data-tab="10"]') ||
-                document.querySelector('div[contenteditable="true"][role="textbox"]');
+  const input =
+    document.querySelector('[data-testid="conversation-compose-box-input"]') ||
+    document.querySelector('div[contenteditable="true"][data-tab="10"]') ||
+    document.querySelector('div[contenteditable="true"][role="textbox"]');
 
   if (!input) {
     console.error("[WA-LLM] Could not find message input box");
@@ -213,12 +296,8 @@ function injectTextIntoInput(text) {
   }
 
   input.focus();
-
-  // Use execCommand to properly trigger React's synthetic event system
   document.execCommand("selectAll", false, null);
   document.execCommand("insertText", false, text);
-
-  // Dispatch input event to make sure React state updates
   input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
@@ -233,14 +312,63 @@ function escapeHtml(str) {
     .replace(/\n/g, "<br>");
 }
 
+function normalizeKeywords(keywords) {
+  return (Array.isArray(keywords) ? keywords : [])
+    .map((kw) => String(kw).trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function extractMessageText(node) {
+  if (!node) return "";
+
+  const selectors = [
+    "span.selectable-text",
+    "div.copyable-text span[dir='ltr']",
+    "div.copyable-text span[dir='auto']",
+    '[data-testid="msg-text"]',
+    '[data-testid="conversation-text-message"]'
+  ];
+
+  for (const selector of selectors) {
+    const candidates = Array.from(node.querySelectorAll(selector));
+    const text = candidates.map((el) => el.innerText?.trim() || "").filter(Boolean).join(" ").trim();
+    if (text) return text;
+  }
+
+  const copyable = node.querySelector("div.copyable-text");
+  if (copyable?.innerText?.trim()) {
+    return copyable.innerText.trim();
+  }
+
+  if (node.innerText?.trim() && node.innerText.trim().length < 2000) {
+    return node.innerText.trim();
+  }
+
+  return "";
+}
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-// Wait for WhatsApp to fully load
+let attempts = 0;
 const bootInterval = setInterval(() => {
-  if (document.querySelector('[data-testid="default-user"]') ||
-      document.querySelector('[data-testid="chat-list"]') ||
-      document.querySelector('[data-testid="side"]')) {
+  attempts++;
+
+  const isLoaded =
+    document.getElementById("pane-side") ||
+    document.querySelector("#app .two") ||
+    // Modern WhatsApp Web selectors (updated from stale title attribute)
+    document.querySelector('[data-testid="chat-list"]') ||
+    document.querySelector('[data-testid="search-input-container"]') ||
+    document.querySelector('div[contenteditable="true"][data-tab="3"]');
+
+  if (isLoaded) {
+    console.log("[WA-LLM] WhatsApp UI detected!");
     clearInterval(bootInterval);
     init();
+  } else if (attempts > 30) {
+    clearInterval(bootInterval);
+    console.error("[WA-LLM] Gave up waiting for WhatsApp UI.");
+  } else if (attempts % 5 === 0) {
+    console.log(`[WA-LLM] Waiting for WhatsApp to load... (attempt ${attempts})`);
   }
-}, 1500);
+}, 2000);

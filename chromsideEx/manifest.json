@@ -5,7 +5,8 @@
   "description": "Auto-suggest replies using your local LLM via MCP bridge",
   "permissions": [
     "storage",
-    "activeTab"
+    "activeTab",
+    "alarms"
   ],
   "host_permissions": [
     "https://web.whatsapp.com/*",
