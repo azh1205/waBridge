@@ -80,8 +80,8 @@
 </head>
 <body>
   <div class="header">
-    ⚡ WA LLM Assistant
-    <small>Powered by LM Studio</small>
+    WA LLM Assistant
+    <small>Local or OpenRouter</small>
   </div>
   <div class="body">
     <div>
@@ -97,9 +97,17 @@
       <div class="hint">Comma-separated. Reply suggestions trigger when any keyword is detected.</div>
     </div>
     <div>
-      <label>Model Name</label>
-      <input type="text" id="model" placeholder="local-model" />
-      <div class="hint">Match the model name from LM Studio (e.g. llama-3.2-3b-instruct)</div>
+      <label>Provider</label>
+      <select id="provider">
+        <option value="local">Local Model</option>
+        <option value="openrouter">OpenRouter API</option>
+      </select>
+      <div class="hint">Choose whether replies come from your local LM Studio model or OpenRouter.</div>
+    </div>
+    <div>
+      <label>Model</label>
+      <select id="model"></select>
+      <div class="hint" id="modelHint">Loading available models...</div>
     </div>
     <div>
       <label>System Prompt</label>

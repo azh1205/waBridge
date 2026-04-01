@@ -5,8 +5,9 @@
 console.log("[WA-LLM] Content script successfully loaded. Waiting for WhatsApp UI...");
 
 const MCP_SERVER = "http://localhost:3000";
+const AUTO_IMAGE_SCAN_LIMIT = 4;
 
-let settings = { keywords: [], model: "local-model", systemPrompt: "", autoSend: false, autoSendDelay: 5 };
+let settings = { keywords: [], provider: "local", model: "local-model", systemPrompt: "", autoSend: false, autoSendDelay: 5 };
 let lastProcessedSignature = null;
 let suggestionPanel = null;
 let isProcessing = false;
@@ -20,6 +21,7 @@ let panelDragState = null;
 let autoSendTimer = null;
 let currentChatHistory = [];
 let lastContactName = "";
+let awaitingIncomingContact = "";
 
 // ─── Extension health check ───────────────────────────────────────────────────
 
@@ -51,6 +53,7 @@ async function init() {
   try {
     settings = await getSettings();
     settings.keywords = normalizeKeywords(settings.keywords);
+    settings.provider = normalizeProvider(settings.provider);
     settings.autoSend = Boolean(settings.autoSend);
     settings.autoSendDelay = normalizeAutoSendDelay(settings.autoSendDelay);
     console.log("[WA-LLM] Settings loaded.", settings);
@@ -58,6 +61,7 @@ async function init() {
     console.error("[WA-LLM] Failed to load settings, using defaults.", err);
     settings = {
       keywords: ["help", "support", "info", "halo", "hai"],
+      provider: "local",
       model: "local-model",
       systemPrompt: "",
       autoSend: false,
@@ -86,6 +90,7 @@ function getSettings() {
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "sync") return;
   if (changes.keywords) settings.keywords = normalizeKeywords(changes.keywords.newValue);
+  if (changes.provider) settings.provider = normalizeProvider(changes.provider.newValue);
   if (changes.model) settings.model = changes.model.newValue || "local-model";
   if (changes.systemPrompt) settings.systemPrompt = changes.systemPrompt.newValue || "";
   if (changes.autoSend) settings.autoSend = Boolean(changes.autoSend.newValue);
@@ -147,12 +152,25 @@ function processMessageNode(node) {
   const signature = `${msgId || "no-id"}::${messageText}`;
   if (signature === lastProcessedSignature) return;
 
-  const direction = node.closest('[class*="message-out"]') ? "outgoing" : "incoming";
+  const direction = getMessageDirection(node, msgId);
   console.log(`[WA-LLM] Captured ${direction} message: "${messageText.substring(0, 50)}"`);
 
   // Update current contact on every message check
   currentContactName = getContactName();
   void refreshStoredChatHistory(currentContactName);
+
+  if (awaitingIncomingContact === currentContactName) {
+    lastProcessedSignature = signature;
+    if (direction !== "incoming") {
+      return;
+    }
+    awaitingIncomingContact = "";
+  }
+
+  if (direction !== "incoming") {
+    lastProcessedSignature = signature;
+    return;
+  }
 
   const matched = settings.keywords.some((kw) =>
     messageText.toLowerCase().includes(kw)
@@ -174,12 +192,15 @@ async function handleKeywordMatch(messageText) {
 
   const contactName = getContactName();
   const chatHistory = await refreshStoredChatHistory(contactName);
-  const imagePayload = await buildAutoImagePayload(contactName);
+  const imagePayload = shouldAttachImageContext(messageText)
+    ? await buildAutoImagePayload(contactName)
+    : {};
 
   requestSuggestion({
     message: messageText,
     contactName,
     chatHistory,
+    provider: settings.provider,
     model: settings.model,
     systemPrompt: settings.systemPrompt,
     ...imagePayload,
@@ -189,6 +210,7 @@ async function handleKeywordMatch(messageText) {
 function requestSuggestion(payload) {
   console.log("[WA-LLM] Requesting suggestion", {
     contactName: payload.contactName,
+    provider: payload.provider,
     historyLength: Array.isArray(payload.chatHistory) ? payload.chatHistory.length : 0,
     hasImage: Boolean(payload.imageDataUrl || payload.latestImageKey),
   });
@@ -208,6 +230,7 @@ function requestSuggestion(payload) {
       if (response?.ok) {
         if (payload.latestImageKey && (payload.imageDataUrl || payload.forceImageRefresh)) {
           void setStoredImageKey(payload.contactName, payload.latestImageKey);
+          void clearIgnoredImageKey(payload.contactName);
         }
         console.log("[WA-LLM] Suggestion received successfully for", payload.contactName);
         showPanel("suggestion", response.reply);
@@ -229,13 +252,14 @@ async function analyzeLatestImage() {
 
   try {
     const latestImage = await getLatestImageInfo();
-    const latestMessage = extractMessageText(getLatestMessageNode());
+    const latestMessage = sanitizeImageAnalysisMessage(extractMessageText(getLatestMessageNode()));
     const chatHistory = await refreshStoredChatHistory(currentContactName);
 
     requestSuggestion({
       message: latestMessage || "Please analyze the latest attached image and suggest a helpful WhatsApp reply.",
       contactName: currentContactName,
       chatHistory,
+      provider: settings.provider,
       model: settings.model,
       systemPrompt: settings.systemPrompt,
       imageDataUrl: latestImage.imageDataUrl,
@@ -253,7 +277,17 @@ async function clearLatestImageCache() {
   currentContactName = getContactName();
 
   try {
+    const latestImage = await getLatestImageInfo({
+      requireVisible: false,
+      includeDataUrl: false,
+      scanLimit: AUTO_IMAGE_SCAN_LIMIT,
+    });
     await clearStoredImageKey(currentContactName);
+    if (latestImage?.imageKey) {
+      await setIgnoredImageKey(currentContactName, latestImage.imageKey);
+    } else {
+      await clearIgnoredImageKey(currentContactName);
+    }
     await fetch(`${MCP_SERVER}/image-context/${encodeURIComponent(currentContactName)}`, {
       method: "DELETE",
     });
@@ -270,7 +304,11 @@ function collectChatHistory() {
   const messages = document.querySelectorAll('[data-id], div[class*="message-in"], div[class*="message-out"]');
   const recent = Array.from(messages).slice(-10);
   for (const el of recent) {
-    const isOutgoing = el.closest('[class*="message-out"]') !== null;
+    const msgId =
+      el.getAttribute("data-id") ||
+      el.closest("[data-id]")?.getAttribute("data-id") ||
+      el.querySelector("[data-id]")?.getAttribute("data-id");
+    const isOutgoing = getMessageDirection(el, msgId) === "outgoing";
     const text = extractMessageText(el);
     if (!text) continue;
     history.push({ role: isOutgoing ? "assistant" : "user", content: text });
@@ -775,6 +813,7 @@ async function sendSuggestion() {
 
   document.getElementById("wa-llm-footer").style.display = "none";
   document.getElementById("wa-llm-body").innerHTML = `<div class="wa-llm-idle">✓ Sent! Waiting for next keyword...</div>`;
+  awaitingIncomingContact = currentContactName;
 }
 
 function regenerate() {
@@ -870,8 +909,17 @@ function wait(ms) {
 // ─── Utils ────────────────────────────────────────────────────────────────────
 
 async function buildAutoImagePayload(contactName) {
-  const latestImage = await getLatestImageInfo({ requireVisible: false, includeDataUrl: false });
+  const latestImage = await getLatestImageInfo({
+    requireVisible: false,
+    includeDataUrl: false,
+    scanLimit: AUTO_IMAGE_SCAN_LIMIT,
+  });
   if (!latestImage) {
+    return {};
+  }
+
+  const ignoredImageKey = await getIgnoredImageKey(contactName);
+  if (ignoredImageKey && ignoredImageKey === latestImage.imageKey) {
     return {};
   }
 
@@ -880,13 +928,17 @@ async function buildAutoImagePayload(contactName) {
     return { latestImageKey: latestImage.imageKey };
   }
 
-  const latestImageWithData = await getLatestImageInfo({ requireVisible: true, includeDataUrl: true });
+  const latestImageWithData = await getLatestImageInfo({
+    requireVisible: true,
+    includeDataUrl: true,
+    scanLimit: AUTO_IMAGE_SCAN_LIMIT,
+  });
   return latestImageWithData;
 }
 
 async function getLatestImageInfo(options = {}) {
-  const { requireVisible = true, includeDataUrl = true } = options;
-  const imageNode = getLatestImageNode();
+  const { requireVisible = true, includeDataUrl = true, scanLimit = Infinity } = options;
+  const imageNode = getLatestImageNode(scanLimit);
   if (!imageNode) {
     if (requireVisible) {
       throw new Error("No visible image found in this chat.");
@@ -903,13 +955,16 @@ async function getLatestImageInfo(options = {}) {
   return imageInfo;
 }
 
-function getLatestImageNode() {
+function getLatestImageNode(scanLimit = Infinity) {
   const containers = Array.from(
     document.querySelectorAll('[data-id], div[class*="message-in"], div[class*="message-out"]')
   );
+  const limitedContainers = Number.isFinite(scanLimit)
+    ? containers.slice(-Math.max(1, scanLimit))
+    : containers;
 
-  for (let i = containers.length - 1; i >= 0; i--) {
-    const images = Array.from(containers[i].querySelectorAll("img"));
+  for (let i = limitedContainers.length - 1; i >= 0; i--) {
+    const images = Array.from(limitedContainers[i].querySelectorAll("img"));
     for (let j = images.length - 1; j >= 0; j--) {
       if (isUsableChatImage(images[j])) {
         return images[j];
@@ -1011,8 +1066,40 @@ function clearStoredImageKey(contactName) {
   });
 }
 
+function getIgnoredImageKey(contactName) {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([getIgnoredImageStorageKey(contactName)], (data) => {
+      resolve(data[getIgnoredImageStorageKey(contactName)]?.latestImageKey || "");
+    });
+  });
+}
+
+function setIgnoredImageKey(contactName, latestImageKey) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set(
+      {
+        [getIgnoredImageStorageKey(contactName)]: {
+          latestImageKey,
+          updatedAt: new Date().toISOString(),
+        },
+      },
+      resolve
+    );
+  });
+}
+
+function clearIgnoredImageKey(contactName) {
+  return new Promise((resolve) => {
+    chrome.storage.local.remove(getIgnoredImageStorageKey(contactName), resolve);
+  });
+}
+
 function getImageCacheStorageKey(contactName) {
   return `waBridge:imageCache:${contactName}`;
+}
+
+function getIgnoredImageStorageKey(contactName) {
+  return `waBridge:ignoredImage:${contactName}`;
 }
 
 function escapeHtml(str) {
@@ -1024,6 +1111,62 @@ function escapeHtml(str) {
 function normalizeKeywords(keywords) {
   return (Array.isArray(keywords) ? keywords : [])
     .map((kw) => String(kw).trim().toLowerCase()).filter(Boolean);
+}
+
+function normalizeProvider(provider) {
+  return provider === "openrouter" ? "openrouter" : "local";
+}
+
+function shouldAttachImageContext(messageText) {
+  const normalized = String(messageText || "").trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return /\b(image|img|photo|picture|pic|screenshot|screen shot|vision|lihat|foto|gambar)\b/i.test(normalized);
+}
+
+function sanitizeImageAnalysisMessage(text) {
+  const normalized = String(text || "").trim();
+  if (!normalized) {
+    return "";
+  }
+
+  if (/^\d{1,2}:\d{2}\s?(am|pm)$/i.test(normalized)) {
+    return "";
+  }
+
+  return normalized;
+}
+
+function getMessageDirection(node, msgId = "") {
+  if (node.closest('[class*="message-out"]')) {
+    return "outgoing";
+  }
+
+  if (node.closest('[class*="message-in"]')) {
+    return "incoming";
+  }
+
+  const normalizedId = String(msgId || "").trim().toLowerCase();
+  if (normalizedId.startsWith("true_") || normalizedId.includes("_true_")) {
+    return "outgoing";
+  }
+  if (normalizedId.startsWith("false_") || normalizedId.includes("_false_")) {
+    return "incoming";
+  }
+
+  const nestedOutgoing = node.querySelector('[data-id^="true_"]');
+  if (nestedOutgoing) {
+    return "outgoing";
+  }
+
+  const nestedIncoming = node.querySelector('[data-id^="false_"]');
+  if (nestedIncoming) {
+    return "incoming";
+  }
+
+  return "incoming";
 }
 
 function getCurrentSuggestionText() {
@@ -1212,3 +1355,6 @@ const bootInterval = setInterval(() => {
     console.log(`[WA-LLM] Waiting for WhatsApp to load... (attempt ${attempts})`);
   }
 }, 2000);
+
+
+

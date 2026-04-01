@@ -1,4 +1,4 @@
-// background.js — Service Worker
+// background.js - Service Worker
 // Handles communication between content script and MCP bridge server
 
 chrome.runtime.onStartup.addListener(() => {
@@ -10,9 +10,8 @@ chrome.runtime.onInstalled.addListener(() => {
   setupKeepAlive();
 });
 
-// Use chrome.alarms to keep the service worker alive (setInterval doesn't work in MV3)
 function setupKeepAlive() {
-  chrome.alarms.create("keepAlive", { periodInMinutes: 0.4 }); // every ~24s
+  chrome.alarms.create("keepAlive", { periodInMinutes: 0.4 });
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -22,15 +21,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 const MCP_SERVER = "http://localhost:3000";
-const SUGGESTION_TIMEOUT_MS = 12000;
+const SUGGESTION_TIMEOUT_MS = 30000;
 const SUGGESTION_RETRY_COUNT = 1;
+const DEFAULT_PROVIDER = "local";
+const DEFAULT_MODEL = "local-model";
+const DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini";
+const DEFAULT_SYSTEM_PROMPT = "You are a helpful WhatsApp assistant. Reply concisely and naturally.";
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   console.log("[waBridge] Background message received:", msg?.type, {
     tabId: sender?.tab?.id,
     contactName: msg?.payload?.contactName,
   });
-  // Health check from content.js — must respond or the page will reload
+
   if (msg.type === "PING") {
     sendResponse({ ok: true });
     return true;
@@ -40,15 +43,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     fetchSuggestion(msg.payload)
       .then((reply) => sendResponse({ ok: true, reply }))
       .catch((err) => sendResponse({ ok: false, error: err.message }));
-    return true; // keep channel open for async
+    return true;
   }
 
   if (msg.type === "GET_SETTINGS") {
-    chrome.storage.sync.get(["keywords", "model", "systemPrompt", "autoSend", "autoSendDelay"], (data) => {
+    chrome.storage.sync.get(["keywords", "provider", "model", "systemPrompt", "autoSend", "autoSendDelay"], (data) => {
+      const provider = data.provider || DEFAULT_PROVIDER;
       sendResponse({
         keywords: data.keywords || ["help", "support", "info", "halo", "hai"],
-        model: data.model || "local-model",
-        systemPrompt: data.systemPrompt || "You are a helpful WhatsApp assistant. Reply concisely and naturally.",
+        provider,
+        model: data.model || (provider === "openrouter" ? DEFAULT_OPENROUTER_MODEL : DEFAULT_MODEL),
+        systemPrompt: data.systemPrompt || DEFAULT_SYSTEM_PROMPT,
         autoSend: data.autoSend || false,
         autoSendDelay: data.autoSendDelay || 5,
       });
@@ -73,6 +78,7 @@ async function fetchSuggestion(payload) {
       console.log("[waBridge] Fetching suggestion", {
         attempt: attemptNumber,
         contactName: payload.contactName,
+        provider: payload.provider,
         historyLength: Array.isArray(payload.chatHistory) ? payload.chatHistory.length : 0,
       });
 
@@ -87,7 +93,21 @@ async function fetchSuggestion(payload) {
       );
 
       if (!response.ok) {
-        throw new Error(`MCP server error: ${response.status}`);
+        const rawBody = await response.text();
+        let message = `MCP server error: ${response.status}`;
+
+        try {
+          const parsed = JSON.parse(rawBody);
+          if (parsed?.error) {
+            message = parsed.error;
+          }
+        } catch {
+          if (rawBody.trim()) {
+            message = `${message} - ${rawBody.trim().slice(0, 300)}`;
+          }
+        }
+
+        throw new Error(message);
       }
 
       const data = await response.json();
@@ -131,12 +151,12 @@ function getFriendlySuggestionError(error) {
   if (!error) return "Server not reachable";
 
   if (error.name === "AbortError") {
-    return "Server not reachable";
+    return `Suggestion request timed out after ${Math.round(SUGGESTION_TIMEOUT_MS / 1000)}s. The bridge is probably running, but the selected model may be too slow.`;
   }
 
   const message = String(error.message || "");
   if (/failed to fetch/i.test(message)) {
-    return "Server not reachable";
+    return `Could not reach waBridge at ${MCP_SERVER}. Make sure the local bridge server is running and the extension has been reloaded.`;
   }
 
   return message;

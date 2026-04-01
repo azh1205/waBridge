@@ -7,8 +7,17 @@
       "Rodent family classification"
     ],
     "notes": "Knowledgeable about mammals, good conversationalist",
-    "messageCount": 78,
-    "lastSeen": "2026-04-01T08:08:17.327Z",
-    "updatedAt": "2026-04-01T08:08:17.327Z"
+    "messageCount": 125,
+    "lastSeen": "2026-04-01T14:08:36.770Z",
+    "updatedAt": "2026-04-01T14:08:36.770Z"
+  },
+  "Test": {
+    "name": "Test",
+    "style": "",
+    "topics": [],
+    "notes": "",
+    "messageCount": 1,
+    "lastSeen": "2026-04-01T09:41:43.920Z",
+    "updatedAt": "2026-04-01T09:41:43.920Z"
   }
 }

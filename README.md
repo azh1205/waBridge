@@ -1,11 +1,12 @@
 # WhatsApp LLM Bridge
 
-`waBridge` connects WhatsApp Web to a local model running in LM Studio. It pairs a Chrome extension with a small Express server so you can generate suggested replies, optionally call MCP tools, and keep lightweight contact memory on your machine.
+`waBridge` connects WhatsApp Web to either a local model running in LM Studio or a hosted model through OpenRouter. It pairs a Chrome extension with a small Express server so you can generate suggested replies, optionally call MCP tools, and keep lightweight contact memory on your machine.
 
 ## Overview
 
-- Local-first reply suggestions for WhatsApp Web
+- Reply suggestions for WhatsApp Web using either LM Studio or OpenRouter
 - LM Studio integration through the OpenAI-compatible chat API
+- OpenRouter integration for hosted model access
 - Optional MCP tool access for file, web, GitHub, and memory workflows
 - Simple contact memory stored in `contacts.json`
 - Image context caching stored in `image-contexts.json`
@@ -17,7 +18,7 @@ WhatsApp Web
   -> Chrome extension
   -> POST /suggest
   -> waBridge server
-  -> LM Studio
+  -> selected provider
   -> optional MCP tool calls
   -> suggested reply
   -> extension panel
@@ -44,8 +45,9 @@ WhatsApp Web
 ## Requirements
 
 - Node.js
-- LM Studio with at least one loaded model
+- LM Studio with at least one loaded model for local mode
 - Chrome or any Chromium-based browser
+- OpenRouter API key for hosted mode
 - Optional MCP servers installed in your LM Studio MCP directory
 
 ## Quick start
@@ -67,7 +69,15 @@ Then update `.env` with the correct local paths and values:
 | Variable | Purpose |
 |---|---|
 | `LM_STUDIO_URL` | LM Studio server URL, usually `http://localhost:1234` |
-| `DEFAULT_MODEL` | Default model id to use for suggestions |
+| `DEFAULT_PROVIDER` | Default reply provider: `local` or `openrouter` |
+| `DEFAULT_MODEL` | Default local model id to use for suggestions |
+| `DEFAULT_OPENROUTER_MODEL` | Default hosted model when using OpenRouter. Use `openrouter/free` for free-only routing |
+| `OPENROUTER_VISION_MODEL` | Vision-capable hosted model used automatically for image requests. `google/gemma-3-4b-it:free` is a practical free default |
+| `OPENROUTER_API_KEY` | Required for OpenRouter mode |
+| `OPENROUTER_URL` | OpenRouter base URL, usually `https://openrouter.ai/api/v1` |
+| `OPENROUTER_MODELS` | Comma-separated list used in the extension model dropdown for OpenRouter. Keep this as `openrouter/free` for free-only usage |
+| `OPENROUTER_SITE_URL` | Optional referer header sent to OpenRouter |
+| `OPENROUTER_SITE_NAME` | Optional title header sent to OpenRouter |
 | `PORT` | Local bridge port, default `3000` |
 | `NODE_BIN` | Full path to `node.exe` |
 | `MCP_BASE` | Base folder containing your MCP servers |
@@ -76,9 +86,11 @@ Then update `.env` with the correct local paths and values:
 | `LM_API_KEY` | Optional API key if your LM Studio server requires one |
 | `ENABLE_MCP_TOOLS` | Set to `true` to allow automatic tool use |
 
-### 3. Start LM Studio
+### 3. Start your provider
 
-Load a model in LM Studio and start the local server.
+For local mode, load a model in LM Studio and start the local server.
+
+For OpenRouter mode, make sure `OPENROUTER_API_KEY` is set in `.env`. The sample config now defaults to `openrouter/free`, which routes only to currently available free models.
 
 ### 4. Start the bridge server
 
@@ -107,6 +119,7 @@ Open these endpoints in your browser:
 
 - `http://localhost:3000/health`
 - `http://localhost:3000/status`
+- `http://localhost:3000/providers`
 
 ## MCP integration
 
@@ -124,6 +137,8 @@ If one server fails, the bridge continues running with the rest of the available
 The `POST /suggest` endpoint accepts message text plus optional chat and image context.
 
 - Text-only requests can use MCP tools when `ENABLE_MCP_TOOLS=true` and the selected model appears capable enough
+- OpenRouter requests skip MCP tool mode by default
+- OpenRouter image requests automatically use `OPENROUTER_VISION_MODEL`, which defaults to `google/gemma-3-4b-it:free`
 - Image requests use a multimodal prompt path instead of the MCP tool loop
 - If the first result looks malformed or schema-like, the bridge retries with a simpler prompt
 - Tool use is capped at `5` rounds in the current implementation
@@ -132,22 +147,19 @@ The `POST /suggest` endpoint accepts message text plus optional chat and image c
 
 ### `GET /health`
 
-Returns:
-
-- bridge status
-- LM Studio availability
-- detected model list
-- MCP readiness summary
+Returns bridge status, LM Studio availability, detected local model list, OpenRouter readiness, and MCP readiness summary.
 
 ### `GET /status`
 
-Returns:
+Returns bridge status, configured port, provider configuration, available tool names, and the number of saved contacts.
 
-- bridge status
-- configured port
-- LM Studio URL
-- available tool names
-- number of saved contacts
+### `GET /providers`
+
+Returns the provider catalog used by the extension popup:
+
+- `local` models detected from LM Studio
+- `openrouter` models from `OPENROUTER_MODELS` such as `openrouter/free`
+- default provider information
 
 ### `POST /suggest`
 
@@ -158,6 +170,7 @@ Example request body:
   "message": "Can you check the screenshot?",
   "contactName": "Budi",
   "chatHistory": [],
+  "provider": "local",
   "model": "local-model",
   "systemPrompt": "You are a helpful WhatsApp assistant.",
   "useTools": true,
@@ -170,6 +183,7 @@ Example request body:
 Field notes:
 
 - `message` is required
+- `provider` chooses between `local` and `openrouter`
 - `chatHistory` should use chat-completions style message objects
 - `useTools` can force-enable or disable MCP tool usage
 - `imageDataUrl` enables image-aware reply generation
@@ -190,9 +204,10 @@ Contact memory is intentionally lightweight. The bridge automatically tracks mes
 | Problem | Fix |
 |---|---|
 | LM Studio is offline | Start the LM Studio local server and verify `LM_STUDIO_URL` |
+| OpenRouter replies fail | Check `OPENROUTER_API_KEY`, selected model name, and internet access on the machine running `server.js` |
 | MCP tools do not appear | Check `MCP_BASE`, `NODE_BIN`, and confirm each MCP server contains `server.js` |
 | `file-reader` cannot access files | Make sure `ALLOWED_DIR` points to a valid readable directory |
 | GitHub tool fails | Set a valid `GITHUB_TOKEN` in `.env` |
 | The extension cannot reach the bridge | Confirm the bridge is running and `MCP_SERVER` in `chromsideEx/background.js` matches your current port |
-| Tool calling is unreliable | Enable `ENABLE_MCP_TOOLS=true` and use a model that supports tool use well |
+| Tool calling is unreliable | Enable `ENABLE_MCP_TOOLS=true` and use a local model that supports tool use well |
 | Image requests fail | Reduce the image size or crop the screenshot before sending |

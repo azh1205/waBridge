@@ -1,6 +1,4 @@
-// server.js — WhatsApp LLM Bridge Server
-// Memory: stored in contacts.json, NO LLM extraction — manual only
-
+import fs from "fs";
 import express from "express";
 import cors from "cors";
 import { McpManager } from "./mcp-manager.js";
@@ -14,21 +12,33 @@ import {
 } from "./memory-store.js";
 import { deleteImageContext, getImageContext, upsertImageContext } from "./image-context-store.js";
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+loadEnvFile();
 
-const PORT          = process.env.PORT          || 3000;
-const LM_URL        = process.env.LM_STUDIO_URL  || "http://localhost:1234";
-const LM_API_KEY    = process.env.LM_API_KEY     || "";
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL  || "local-model";
+const PORT = process.env.PORT || 3000;
+const LM_URL = process.env.LM_STUDIO_URL || "http://localhost:1234";
+const LM_API_KEY = process.env.LM_API_KEY || "";
+const OPENROUTER_URL = process.env.OPENROUTER_URL || "https://openrouter.ai/api/v1";
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "";
+const OPENROUTER_SITE_NAME = process.env.OPENROUTER_SITE_NAME || "waBridge";
+const DEFAULT_PROVIDER = (process.env.DEFAULT_PROVIDER || "local").toLowerCase() === "openrouter" ? "openrouter" : "local";
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "local-model";
+const DEFAULT_OPENROUTER_MODEL = process.env.DEFAULT_OPENROUTER_MODEL || "openrouter/free";
+const DEFAULT_OPENROUTER_VISION_MODEL = process.env.OPENROUTER_VISION_MODEL || "google/gemma-3-4b-it:free";
+const OPENROUTER_MODELS = parseConfiguredModels(
+  process.env.OPENROUTER_MODELS,
+  [
+    DEFAULT_OPENROUTER_MODEL,
+    "openrouter/free",
+  ]
+);
 const MAX_TOOL_ROUNDS = 5;
 const ENABLE_MCP_TOOLS = String(process.env.ENABLE_MCP_TOOLS || "false").toLowerCase() === "true";
 
 const DEFAULT_SYSTEM_PROMPT =
   "You are a helpful WhatsApp assistant. " +
-  "Reply concisely and naturally — this is a WhatsApp message, not an essay. " +
+  "Reply concisely and naturally - this is a WhatsApp message, not an essay. " +
   "Reply in the same language the user is writing in.";
-
-// ─── Boot ─────────────────────────────────────────────────────────────────────
 
 const mcpManager = new McpManager();
 const app = express();
@@ -36,41 +46,73 @@ const app = express();
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "12mb" }));
 
-console.log("\n╔══════════════════════════════════════════════╗");
-console.log("║     WhatsApp LLM Bridge — Starting Up        ║");
-console.log("╚══════════════════════════════════════════════╝\n");
+console.log("\n==============================================");
+console.log("  WhatsApp LLM Bridge - Starting Up");
+console.log("==============================================\n");
 
 await mcpManager.start();
 
-// ─── Routes: Core ─────────────────────────────────────────────────────────────
-
 app.get("/health", async (_req, res) => {
-  let lmStatus = "offline";
-  let models = [];
-  try {
-    const r = await lmFetch("GET", "/v1/models");
-    models = r.data?.map((m) => m.id) || [];
-    lmStatus = "online";
-  } catch {}
-  res.json({ status: "ok", lmStudio: lmStatus, model: models[0] || DEFAULT_MODEL, models, mcp: mcpManager.status() });
+  const localModels = await getLocalModels();
+  const lmStatus = localModels.length ? "online" : "offline";
+
+  res.json({
+    status: "ok",
+    provider: DEFAULT_PROVIDER,
+    lmStudio: lmStatus,
+    openrouter: OPENROUTER_API_KEY ? "configured" : "missing_api_key",
+    model: DEFAULT_PROVIDER === "openrouter" ? DEFAULT_OPENROUTER_MODEL : (localModels[0] || DEFAULT_MODEL),
+    models: localModels,
+    openrouterModels: OPENROUTER_MODELS,
+    mcp: mcpManager.status(),
+  });
 });
 
 app.get("/status", (_req, res) => {
   res.json({
-    bridge: "running", port: PORT, lmStudio: LM_URL,
+    bridge: "running",
+    port: PORT,
+    lmStudio: LM_URL,
+    defaultProvider: DEFAULT_PROVIDER,
+    openrouterConfigured: Boolean(OPENROUTER_API_KEY),
     mcpServers: mcpManager.status(),
-    availableTools: mcpManager.getToolsForLLM().map((t) => t.function.name),
+    availableTools: mcpManager.getToolsForLLM().map((tool) => tool.function.name),
     contacts: Object.keys(getAllContacts()).length,
   });
 });
 
-// Main suggest endpoint
+app.get("/providers", async (_req, res) => {
+  const localModels = await getLocalModels();
+  res.json({
+    defaultProvider: DEFAULT_PROVIDER,
+    providers: [
+      {
+        id: "local",
+        label: "Local Model",
+        hint: localModels.length
+          ? `Using models currently exposed by LM Studio at ${LM_URL}.`
+          : "No local models detected. Start LM Studio and load a model.",
+        models: mapModelOptions(localModels, DEFAULT_MODEL),
+      },
+      {
+        id: "openrouter",
+        label: "OpenRouter API",
+        hint: OPENROUTER_API_KEY
+          ? `Using the curated OpenRouter model list from waBridge. Image requests automatically use ${DEFAULT_OPENROUTER_VISION_MODEL}.`
+          : "Set OPENROUTER_API_KEY in your environment before using OpenRouter.",
+        models: mapModelOptions(OPENROUTER_MODELS, DEFAULT_OPENROUTER_MODEL),
+      },
+    ],
+  });
+});
+
 app.post("/suggest", async (req, res) => {
   const {
     message,
-    contactName  = "Contact",
-    chatHistory  = [],
-    model        = DEFAULT_MODEL,
+    contactName = "Contact",
+    chatHistory = [],
+    provider = DEFAULT_PROVIDER,
+    model,
     systemPrompt = DEFAULT_SYSTEM_PROMPT,
     useTools,
     imageDataUrl,
@@ -78,16 +120,25 @@ app.post("/suggest", async (req, res) => {
     forceImageRefresh,
   } = req.body;
 
-  if (!message) return res.status(400).json({ error: "message is required" });
+  if (!message) {
+    return res.status(400).json({ error: "message is required" });
+  }
 
-  console.log(`\n[Bridge] Contact: ${contactName} | Message: "${message.slice(0, 60)}"`);
+  const selectedProvider = provider === "openrouter" ? "openrouter" : "local";
+  const selectedModel = model || (selectedProvider === "openrouter" ? DEFAULT_OPENROUTER_MODEL : DEFAULT_MODEL);
+  const selectedVisionModel = selectedProvider === "openrouter"
+    ? DEFAULT_OPENROUTER_VISION_MODEL
+    : selectedModel;
+
+  console.log(`\n[Bridge] Provider: ${selectedProvider} | Contact: ${contactName} | Message: "${message.slice(0, 60)}"`);
 
   try {
     const imageContextSummary = await resolveImageContext({
       contactName,
       latestImageKey,
       imageDataUrl,
-      model,
+      provider: selectedProvider,
+      model: imageDataUrl ? selectedVisionModel : selectedModel,
       forceImageRefresh,
     });
 
@@ -95,14 +146,14 @@ app.post("/suggest", async (req, res) => {
       message,
       contactName,
       chatHistory,
-      model,
+      provider: selectedProvider,
+      model: imageDataUrl ? selectedVisionModel : selectedModel,
       systemPrompt,
       useTools,
       imageDataUrl,
       imageContextSummary,
     });
 
-    // Just track message count + lastSeen — no LLM extraction
     trackMessage(contactName);
 
     console.log(`[Bridge] Reply: "${reply.slice(0, 80)}"`);
@@ -113,47 +164,43 @@ app.post("/suggest", async (req, res) => {
   }
 });
 
-// ─── Routes: Memory ───────────────────────────────────────────────────────────
-
-// List all contacts
 app.get("/memory", (_req, res) => {
   const all = getAllContacts();
-  const summary = Object.values(all).map((c) => ({
-    name: c.name,
-    messageCount: c.messageCount || 0,
-    lastSeen: c.lastSeen,
-    topicsCount: c.topics?.length || 0,
+  const summary = Object.values(all).map((contact) => ({
+    name: contact.name,
+    messageCount: contact.messageCount || 0,
+    lastSeen: contact.lastSeen,
+    topicsCount: contact.topics?.length || 0,
   }));
   res.json({ contacts: summary });
 });
 
-// Get one contact
 app.get("/memory/:name", (req, res) => {
   const contact = getContact(req.params.name);
-  if (!contact) return res.status(404).json({ error: `No memory for "${req.params.name}"` });
+  if (!contact) {
+    return res.status(404).json({ error: `No memory for "${req.params.name}"` });
+  }
   res.json({ contact: formatMemory(contact) });
 });
 
-// Manual write/update
 app.put("/memory/:name", (req, res) => {
   const { style, topics, notes } = req.body;
   const updated = upsertContact(req.params.name, {
-    ...(style  !== undefined && { style }),
+    ...(style !== undefined && { style }),
     ...(topics !== undefined && { topics: Array.isArray(topics) ? topics : [topics] }),
-    ...(notes  !== undefined && { notes }),
+    ...(notes !== undefined && { notes }),
   });
   console.log(`[Memory] Manual write for "${req.params.name}"`);
   res.json({ contact: formatMemory(updated) });
 });
 
-// Delete contact memory
 app.delete("/memory/:name", (req, res) => {
   const deleted = deleteContact(req.params.name);
-  if (!deleted) return res.status(404).json({ error: "Contact not found" });
+  if (!deleted) {
+    return res.status(404).json({ error: "Contact not found" });
+  }
   res.json({ ok: true, deleted: req.params.name });
 });
-
-// ─── Start ────────────────────────────────────────────────────────────────────
 
 app.delete("/image-context/:name", (req, res) => {
   deleteImageContext(req.params.name);
@@ -161,11 +208,12 @@ app.delete("/image-context/:name", (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n╔══════════════════════════════════════════════╗`);
-  console.log(`║  Bridge   : http://localhost:${PORT}              ║`);
-  console.log(`║  LM Studio: ${LM_URL.padEnd(34)}║`);
-  console.log(`║  Tools    : ${String(mcpManager.allTools.length).padEnd(38)}║`);
-  console.log(`╚══════════════════════════════════════════════╝\n`);
+  console.log("\n==============================================");
+  console.log(`  Bridge      : http://localhost:${PORT}`);
+  console.log(`  LM Studio   : ${LM_URL}`);
+  console.log(`  OpenRouter  : ${OPENROUTER_API_KEY ? "configured" : "not configured"}`);
+  console.log(`  Tools       : ${mcpManager.allTools.length}`);
+  console.log("==============================================\n");
 });
 
 app.use((err, _req, res, next) => {
@@ -177,11 +225,12 @@ app.use((err, _req, res, next) => {
   return next(err);
 });
 
-process.on("SIGINT", () => { mcpManager.stopAll(); process.exit(0); });
+process.on("SIGINT", () => {
+  mcpManager.stopAll();
+  process.exit(0);
+});
 
-// ─── Agentic Loop ─────────────────────────────────────────────────────────────
-
-async function generateWithTools({ message, contactName, chatHistory, model, systemPrompt }) {
+async function generateWithTools({ message, contactName, chatHistory, provider, model, systemPrompt }) {
   const tools = mcpManager.getToolsForLLM();
   const messages = [
     { role: "system", content: `${systemPrompt}\n\nYou are replying on behalf of the user in a WhatsApp conversation with ${contactName}.` },
@@ -190,77 +239,95 @@ async function generateWithTools({ message, contactName, chatHistory, model, sys
   ];
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const response = await lmFetch("POST", "/v1/chat/completions", {
-      model, messages, max_tokens: 1000, temperature: 0.7,
+    const response = await providerFetch(provider, "POST", "/chat/completions", {
+      model,
+      messages,
+      max_tokens: 1000,
+      temperature: 0.7,
       ...(tools.length > 0 ? { tools, tool_choice: "auto" } : {}),
     });
 
     const choice = response.choices?.[0];
-    if (!choice) throw new Error("No response from LM Studio");
+    if (!choice) {
+      throw new Error(provider === "openrouter" ? "No response from OpenRouter" : "No response from LM Studio");
+    }
 
-    const { finish_reason, message: assistantMsg } = choice;
+    const assistantMsg = choice.message;
     messages.push(assistantMsg);
 
-    if (finish_reason === "stop" || finish_reason === "length") {
+    if (choice.finish_reason === "stop" || choice.finish_reason === "length") {
       const text = assistantMsg.content?.trim();
       if (text) return text;
     }
 
     const toolCalls = assistantMsg.tool_calls;
-    if (!toolCalls?.length) return assistantMsg.content?.trim() || "Sorry, I couldn't generate a reply.";
+    if (!toolCalls?.length) {
+      return assistantMsg.content?.trim() || "Sorry, I couldn't generate a reply.";
+    }
 
     for (const call of toolCalls) {
       let toolArgs = {};
-      try { toolArgs = JSON.parse(call.function.arguments || "{}"); } catch {}
+      try {
+        toolArgs = JSON.parse(call.function.arguments || "{}");
+      } catch {
+        toolArgs = {};
+      }
+
       let toolResult;
-      try { toolResult = await mcpManager.executeTool(call.function.name, toolArgs); }
-      catch (err) { toolResult = `Tool error: ${err.message}`; }
+      try {
+        toolResult = await mcpManager.executeTool(call.function.name, toolArgs);
+      } catch (err) {
+        toolResult = `Tool error: ${err.message}`;
+      }
+
       messages.push({ role: "tool", tool_call_id: call.id, content: String(toolResult) });
     }
   }
 
-  const fallback = await lmFetch("POST", "/v1/chat/completions", {
-    model, max_tokens: 500, temperature: 0.7,
+  const fallback = await providerFetch(provider, "POST", "/chat/completions", {
+    model,
+    max_tokens: 500,
+    temperature: 0.7,
     messages: [...messages, { role: "user", content: "Give your final WhatsApp reply now." }],
   });
+
   return fallback.choices?.[0]?.message?.content?.trim() || "Sorry, I couldn't generate a reply.";
 }
 
-async function generateReply({ message, contactName, chatHistory, model, systemPrompt, useTools, imageDataUrl, imageContextSummary }) {
-  const shouldUseMcpTools = !imageDataUrl && shouldUseTools({ model, useTools });
+async function generateReply({ message, contactName, chatHistory, provider, model, systemPrompt, useTools, imageDataUrl, imageContextSummary }) {
+  const useMcpTools = !imageDataUrl && shouldUseTools({ provider, model, useTools });
 
-  const primaryReply = shouldUseMcpTools
-    ? await generateWithTools({ message, contactName, chatHistory, model, systemPrompt })
-    : await generatePlainReply({ message, contactName, chatHistory, model, systemPrompt, imageDataUrl, imageContextSummary });
+  const primaryReply = useMcpTools
+    ? await generateWithTools({ message, contactName, chatHistory, provider, model, systemPrompt })
+    : await generatePlainReply({ message, contactName, chatHistory, provider, model, systemPrompt, imageDataUrl, imageContextSummary });
 
   if (!looksLikeGibberish(primaryReply)) {
     return primaryReply;
   }
 
   console.warn(`[Bridge] Detected low-quality model output from "${model}". Retrying with minimal prompt.`);
-  const fallbackReply = await generatePlainReply({
+  return generatePlainReply({
     message,
     contactName,
     chatHistory: [],
+    provider,
     model,
     systemPrompt,
     imageDataUrl,
     imageContextSummary,
   });
-
-  return fallbackReply;
 }
 
-async function generatePlainReply({ message, contactName, chatHistory, model, systemPrompt, imageDataUrl, imageContextSummary }) {
+async function generatePlainReply({ message, contactName, chatHistory, provider, model, systemPrompt, imageDataUrl, imageContextSummary }) {
   const latestUserPrompt = imageDataUrl
     ? [
         {
           type: "text",
           text:
             `Latest context from ${contactName}: "${message}"\n\n` +
-            `Analyze the attached WhatsApp image and write one clear reply the user could send back. ` +
-            `If the image does not need a reply, briefly describe it and suggest a useful response anyway. ` +
-            `Do not explain your reasoning.`,
+            "Analyze the attached WhatsApp image and write one clear reply the user could send back. " +
+            "If the image does not need a reply, briefly describe it and suggest a useful response anyway. " +
+            "Do not explain your reasoning.",
         },
         {
           type: "image_url",
@@ -277,7 +344,7 @@ async function generatePlainReply({ message, contactName, chatHistory, model, sy
       content:
         `${systemPrompt}\n\n` +
         `You are replying on behalf of the user in a WhatsApp conversation with ${contactName}. ` +
-        `Write only the final reply text. Keep it natural, short, and coherent.`,
+        "Write only the final reply text. Keep it natural, short, and coherent.",
     },
     ...chatHistory.slice(imageDataUrl ? -2 : -4),
     {
@@ -286,19 +353,25 @@ async function generatePlainReply({ message, contactName, chatHistory, model, sy
     },
   ];
 
-  const response = await lmFetch("POST", "/v1/chat/completions", {
+  const response = await createChatCompletionWithFallback({
+    provider,
     model,
-    messages,
-    max_tokens: 160,
+    systemPrompt,
+    contactName,
+    chatHistory: chatHistory.slice(imageDataUrl ? -2 : -4),
+    userContent: latestUserPrompt,
+    maxTokens: 160,
     temperature: 0.5,
   });
 
   const text = response.choices?.[0]?.message?.content?.trim();
-  if (!text) throw new Error("Empty response from LM Studio");
+  if (!text) {
+    throw new Error(provider === "openrouter" ? "Empty response from OpenRouter" : "Empty response from LM Studio");
+  }
   return text;
 }
 
-async function resolveImageContext({ contactName, latestImageKey, imageDataUrl, model, forceImageRefresh }) {
+async function resolveImageContext({ contactName, latestImageKey, imageDataUrl, provider, model, forceImageRefresh }) {
   if (!latestImageKey) return "";
 
   const cached = getImageContext(contactName);
@@ -312,7 +385,7 @@ async function resolveImageContext({ contactName, latestImageKey, imageDataUrl, 
     return "";
   }
 
-  const summary = await generateImageSummary({ contactName, imageDataUrl, model });
+  const summary = await generateImageSummary({ contactName, imageDataUrl, provider, model });
   upsertImageContext(contactName, {
     imageKey: latestImageKey,
     summary,
@@ -320,39 +393,34 @@ async function resolveImageContext({ contactName, latestImageKey, imageDataUrl, 
   return summary;
 }
 
-async function generateImageSummary({ contactName, imageDataUrl, model }) {
-  const response = await lmFetch("POST", "/v1/chat/completions", {
+async function generateImageSummary({ contactName, imageDataUrl, provider, model }) {
+  const response = await createChatCompletionWithFallback({
+    provider,
     model,
-    messages: [
+    systemPrompt:
+      "Summarize the attached WhatsApp image for future reply context. " +
+      "Return a short factual summary under 80 words. Focus on what matters for follow-up chat replies.",
+    contactName,
+    chatHistory: [],
+    userContent: [
       {
-        role: "system",
-        content:
-          "Summarize the attached WhatsApp image for future reply context. " +
-          "Return a short factual summary under 80 words. Focus on what matters for follow-up chat replies.",
+        type: "text",
+        text: `Create a compact image context summary for the chat with ${contactName}.`,
       },
       {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `Create a compact image context summary for the chat with ${contactName}.`,
-          },
-          {
-            type: "image_url",
-            image_url: {
-              url: imageDataUrl,
-            },
-          },
-        ],
+        type: "image_url",
+        image_url: {
+          url: imageDataUrl,
+        },
       },
     ],
-    max_tokens: 120,
+    maxTokens: 120,
     temperature: 0.2,
   });
 
   const summary = response.choices?.[0]?.message?.content?.trim();
   if (!summary) {
-    throw new Error("Empty image summary from LM Studio");
+    return "";
   }
   return summary;
 }
@@ -366,8 +434,9 @@ function buildTextOnlyPrompt({ message, contactName, imageContextSummary }) {
   return prompt;
 }
 
-function shouldUseTools({ model, useTools }) {
+function shouldUseTools({ provider, model, useTools }) {
   if (typeof useTools === "boolean") return useTools;
+  if (provider !== "local") return false;
   if (!ENABLE_MCP_TOOLS) return false;
 
   const lowerModel = String(model || "").toLowerCase();
@@ -395,12 +464,11 @@ function looksLikeGibberish(text) {
   return false;
 }
 
-// ─── LM Studio HTTP Helper ────────────────────────────────────────────────────
-
 async function lmFetch(method, path, body = null) {
-  const url = `${LM_URL}${path}`;
+  const url = buildApiUrl(LM_URL, path);
   const headers = { "Content-Type": "application/json" };
-  if (LM_API_KEY) headers["Authorization"] = `Bearer ${LM_API_KEY}`;
+  if (LM_API_KEY) headers.Authorization = `Bearer ${LM_API_KEY}`;
+
   const res = await fetch(url, { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) });
   if (!res.ok) {
     const text = await res.text();
@@ -408,3 +476,196 @@ async function lmFetch(method, path, body = null) {
   }
   return res.json();
 }
+
+async function openRouterFetch(method, path, body = null) {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error("OpenRouter is selected but OPENROUTER_API_KEY is not configured.");
+  }
+
+  const url = buildApiUrl(OPENROUTER_URL, path);
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+  };
+
+  if (OPENROUTER_SITE_URL) {
+    headers["HTTP-Referer"] = OPENROUTER_SITE_URL;
+  }
+  if (OPENROUTER_SITE_NAME) {
+    headers["X-Title"] = OPENROUTER_SITE_NAME;
+  }
+
+  const res = await fetch(url, { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`OpenRouter ${res.status}: ${text.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
+async function providerFetch(provider, method, path, body = null) {
+  return provider === "openrouter"
+    ? openRouterFetch(method, path, body)
+    : lmFetch(method, path, body);
+}
+
+async function createChatCompletionWithFallback({
+  provider,
+  model,
+  systemPrompt,
+  contactName,
+  chatHistory,
+  userContent,
+  maxTokens,
+  temperature,
+}) {
+  const primaryMessages = [
+    {
+      role: "system",
+      content:
+        `${systemPrompt}\n\n` +
+        `You are replying on behalf of the user in a WhatsApp conversation with ${contactName}.`,
+    },
+    ...chatHistory,
+    {
+      role: "user",
+      content: userContent,
+    },
+  ];
+
+  try {
+    return await providerFetch(provider, "POST", "/chat/completions", {
+      model,
+      messages: primaryMessages,
+      max_tokens: maxTokens,
+      temperature,
+    });
+  } catch (error) {
+    if (!shouldRetryWithoutSystemPrompt(provider, error)) {
+      throw error;
+    }
+
+    const fallbackMessages = [
+      ...chatHistory,
+      {
+        role: "user",
+        content: mergeSystemPromptIntoUserContent(systemPrompt, contactName, userContent),
+      },
+    ];
+
+    return providerFetch(provider, "POST", "/chat/completions", {
+      model,
+      messages: fallbackMessages,
+      max_tokens: maxTokens,
+      temperature,
+    });
+  }
+}
+
+function shouldRetryWithoutSystemPrompt(provider, error) {
+  if (provider !== "openrouter") return false;
+  const message = String(error?.message || "").toLowerCase();
+  return message.includes("developer instruction is not enabled");
+}
+
+function mergeSystemPromptIntoUserContent(systemPrompt, contactName, userContent) {
+  const prefix =
+    `${systemPrompt}\n\n` +
+    `You are replying on behalf of the user in a WhatsApp conversation with ${contactName}.`;
+
+  if (Array.isArray(userContent)) {
+    const [firstPart, ...rest] = userContent;
+    if (firstPart?.type === "text") {
+      return [
+        {
+          ...firstPart,
+          text: `${prefix}\n\n${firstPart.text}`,
+        },
+        ...rest,
+      ];
+    }
+
+    return [{ type: "text", text: prefix }, ...userContent];
+  }
+
+  return `${prefix}\n\n${String(userContent || "")}`;
+}
+
+async function getLocalModels() {
+  try {
+    const response = await lmFetch("GET", "/models");
+    return response.data?.map((model) => model.id).filter(Boolean) || [];
+  } catch {
+    return [];
+  }
+}
+
+function buildApiUrl(baseUrl, path) {
+  const normalizedBase = String(baseUrl || "").replace(/\/+$/, "");
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+
+  if (/\/(?:api\/)?v1$/i.test(normalizedBase)) {
+    return `${normalizedBase}${normalizedPath.startsWith("/v1/") ? normalizedPath.slice(3) : normalizedPath}`;
+  }
+
+  return `${normalizedBase}${normalizedPath.startsWith("/v1/") ? normalizedPath : `/v1${normalizedPath}`}`;
+}
+
+function mapModelOptions(models, preferredModel) {
+  return dedupeStrings(models).map((modelId) => ({
+    id: modelId,
+    label: modelId,
+    recommended: modelId === preferredModel,
+  }));
+}
+
+function parseConfiguredModels(value, fallback) {
+  const parsed = String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return dedupeStrings(parsed.length ? parsed : fallback);
+}
+
+function dedupeStrings(values) {
+  return [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+function loadEnvFile() {
+  const envPath = ".env";
+  if (!fs.existsSync(envPath)) {
+    return;
+  }
+
+  const content = fs.readFileSync(envPath, "utf8");
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+
+    const separatorIndex = line.indexOf("=");
+    if (separatorIndex === -1) {
+      continue;
+    }
+
+    const key = line.slice(0, separatorIndex).trim();
+    if (!key || process.env[key] !== undefined) {
+      continue;
+    }
+
+    let value = line.slice(separatorIndex + 1).trim();
+    if (
+      (value.startsWith("\"") && value.endsWith("\"")) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    process.env[key] = value;
+  }
+}
+
+
+
+
