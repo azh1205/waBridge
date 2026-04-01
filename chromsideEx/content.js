@@ -18,6 +18,8 @@ let isMathPreviewOpen = false;
 let isPanelMinimized = false;
 let panelDragState = null;
 let autoSendTimer = null;
+let currentChatHistory = [];
+let lastContactName = "";
 
 // ─── Extension health check ───────────────────────────────────────────────────
 
@@ -66,6 +68,7 @@ async function init() {
 
   injectPanel();
   observeChat();
+  await syncActiveContactContext(true);
   console.log("[WA-LLM] Extension active. Listening for keywords:", settings.keywords);
 }
 
@@ -94,17 +97,24 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
 function observeChat() {
   let debounceTimer = null;
+  console.log("[WA-LLM] Starting DOM observer for WhatsApp chat updates.");
   const observer = new MutationObserver(() => {
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(checkLatestMessage, 300);
+    debounceTimer = setTimeout(() => {
+      void checkLatestMessage();
+    }, 300);
   });
   observer.observe(document.body, { childList: true, subtree: true });
 }
 
-function checkLatestMessage() {
+async function checkLatestMessage() {
+  await syncActiveContactContext();
   if (isProcessing) return;
   const latestMessage = getLatestMessageNode();
-  if (!latestMessage) return;
+  if (!latestMessage) {
+    console.log("[WA-LLM] No latest message node found. DOM selectors may need review.");
+    return;
+  }
   processMessageNode(latestMessage);
 }
 
@@ -142,6 +152,7 @@ function processMessageNode(node) {
 
   // Update current contact on every message check
   currentContactName = getContactName();
+  void refreshStoredChatHistory(currentContactName);
 
   const matched = settings.keywords.some((kw) =>
     messageText.toLowerCase().includes(kw)
@@ -161,8 +172,8 @@ async function handleKeywordMatch(messageText) {
   isProcessing = true;
   showPanel("thinking");
 
-  const chatHistory = collectChatHistory();
   const contactName = getContactName();
+  const chatHistory = await refreshStoredChatHistory(contactName);
   const imagePayload = await buildAutoImagePayload(contactName);
 
   requestSuggestion({
@@ -176,6 +187,12 @@ async function handleKeywordMatch(messageText) {
 }
 
 function requestSuggestion(payload) {
+  console.log("[WA-LLM] Requesting suggestion", {
+    contactName: payload.contactName,
+    historyLength: Array.isArray(payload.chatHistory) ? payload.chatHistory.length : 0,
+    hasImage: Boolean(payload.imageDataUrl || payload.latestImageKey),
+  });
+
   chrome.runtime.sendMessage(
     {
       type: "GET_SUGGESTION",
@@ -183,6 +200,7 @@ function requestSuggestion(payload) {
     },
     (response) => {
       if (chrome.runtime.lastError) {
+        console.error("[WA-LLM] Background message failed:", chrome.runtime.lastError.message);
         showPanel("error", chrome.runtime.lastError.message);
         isProcessing = false;
         return;
@@ -191,8 +209,10 @@ function requestSuggestion(payload) {
         if (payload.latestImageKey && (payload.imageDataUrl || payload.forceImageRefresh)) {
           void setStoredImageKey(payload.contactName, payload.latestImageKey);
         }
+        console.log("[WA-LLM] Suggestion received successfully for", payload.contactName);
         showPanel("suggestion", response.reply);
       } else {
+        console.error("[WA-LLM] Suggestion request returned an error:", response?.error);
         showPanel("error", response?.error || "Unknown error");
       }
       isProcessing = false;
@@ -210,7 +230,7 @@ async function analyzeLatestImage() {
   try {
     const latestImage = await getLatestImageInfo();
     const latestMessage = extractMessageText(getLatestMessageNode());
-    const chatHistory = collectChatHistory();
+    const chatHistory = await refreshStoredChatHistory(currentContactName);
 
     requestSuggestion({
       message: latestMessage || "Please analyze the latest attached image and suggest a helpful WhatsApp reply.",
@@ -226,6 +246,7 @@ async function analyzeLatestImage() {
     showPanel("error", err.message);
     isProcessing = false;
   }
+
 }
 
 async function clearLatestImageCache() {
@@ -255,6 +276,127 @@ function collectChatHistory() {
     history.push({ role: isOutgoing ? "assistant" : "user", content: text });
   }
   return history;
+}
+
+async function syncActiveContactContext(force = false) {
+  const contactName = getContactName();
+  if (!contactName) return;
+  if (!force && contactName === lastContactName) return;
+  const contactChanged = contactName !== lastContactName;
+
+  currentContactName = contactName;
+  lastContactName = contactName;
+  if (contactChanged) {
+    lastProcessedSignature = null;
+    console.log("[WA-LLM] Contact switch detected. Resetting processed message guard for", contactName);
+  }
+
+  currentChatHistory = await loadStoredChatHistory(contactName);
+  console.log("[WA-LLM] Active contact changed:", contactName, {
+    storedMessages: currentChatHistory.length,
+    force,
+    contactChanged,
+  });
+
+  await refreshStoredChatHistory(contactName);
+}
+
+async function refreshStoredChatHistory(contactName) {
+  const storedHistory = contactName === lastContactName
+    ? currentChatHistory
+    : await loadStoredChatHistory(contactName);
+  const visibleHistory = collectChatHistory();
+  const mergedHistory = mergeChatHistories(storedHistory, visibleHistory);
+
+  currentChatHistory = mergedHistory;
+  lastContactName = contactName;
+
+  if (!areHistoriesEqual(storedHistory, mergedHistory)) {
+    await saveStoredChatHistory(contactName, mergedHistory);
+    console.log("[WA-LLM] Synced contact context from DOM:", contactName, {
+      storedMessages: mergedHistory.length,
+    });
+  }
+
+  return mergedHistory;
+}
+
+function loadStoredChatHistory(contactName) {
+  const key = getContactMemoryStorageKey(contactName);
+  return new Promise((resolve) => {
+    chrome.storage.local.get(key, (data) => {
+      const history = normalizeStoredChatHistory(data[key] || []);
+      console.log("[WA-LLM] Loaded local context:", contactName, {
+        storedMessages: history.length,
+      });
+      resolve(history);
+    });
+  });
+}
+
+function saveStoredChatHistory(contactName, chatHistory) {
+  const key = getContactMemoryStorageKey(contactName);
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ [key]: chatHistory }, () => {
+      console.log("[WA-LLM] Saved local context:", contactName, {
+        storedMessages: chatHistory.length,
+      });
+      resolve();
+    });
+  });
+}
+
+function clearStoredChatHistory(contactName) {
+  const key = getContactMemoryStorageKey(contactName);
+  return new Promise((resolve) => {
+    chrome.storage.local.remove(key, () => {
+      console.log("[WA-LLM] Cleared local context:", contactName);
+      resolve();
+    });
+  });
+}
+
+function mergeChatHistories(storedHistory, visibleHistory) {
+  const combined = [...normalizeStoredChatHistory(storedHistory), ...normalizeStoredChatHistory(visibleHistory)];
+  const dedupedReversed = [];
+  const seen = new Set();
+
+  for (let i = combined.length - 1; i >= 0; i--) {
+    const entry = combined[i];
+    const signature = `${entry.role}::${entry.content}`;
+    if (seen.has(signature)) continue;
+    seen.add(signature);
+    dedupedReversed.push(entry);
+  }
+
+  return dedupedReversed.reverse().slice(-20);
+}
+
+function normalizeStoredChatHistory(history) {
+  return (Array.isArray(history) ? history : [])
+    .map((entry) => ({
+      role: entry?.role === "assistant" ? "assistant" : "user",
+      content: String(entry?.content || "").trim(),
+    }))
+    .filter((entry) => entry.content);
+}
+
+function areHistoriesEqual(left, right) {
+  const leftNormalized = normalizeStoredChatHistory(left);
+  const rightNormalized = normalizeStoredChatHistory(right);
+
+  if (leftNormalized.length !== rightNormalized.length) {
+    return false;
+  }
+
+  return leftNormalized.every((entry, index) => (
+    entry.role === rightNormalized[index].role &&
+    entry.content === rightNormalized[index].content
+  ));
+}
+
+function getContactMemoryStorageKey(contactName) {
+  return `memory_${contactName}`;
 }
 
 function getContactName() {
@@ -288,9 +430,11 @@ function injectPanel() {
       <button class="wa-btn wa-btn-primary" id="wa-llm-send">Send ↗</button>
     </div>
     <div class="wa-llm-footer" id="wa-llm-nav-footer" style="display:none">
+      <button class="wa-btn wa-btn-secondary" id="wa-llm-clear-memory">Clear Memory</button>
       <button class="wa-btn wa-btn-secondary" id="wa-llm-back">Back</button>
     </div>
     <div class="wa-llm-footer" id="wa-llm-mem-footer" style="display:none">
+      <button class="wa-btn wa-btn-secondary" id="wa-llm-mem-clear">Clear Memory</button>
       <button class="wa-btn wa-btn-secondary" id="wa-llm-mem-cancel">✕ Cancel</button>
       <button class="wa-btn wa-btn-primary" id="wa-llm-mem-save">💾 Save</button>
     </div>
@@ -351,7 +495,9 @@ function injectPanel() {
   document.getElementById("wa-llm-regen").addEventListener("click", regenerate);
   document.getElementById("wa-llm-read").addEventListener("click", readMemory);
   document.getElementById("wa-llm-write").addEventListener("click", writeMemory);
+  document.getElementById("wa-llm-clear-memory").addEventListener("click", clearContactMemory);
   document.getElementById("wa-llm-back").addEventListener("click", goBackToPreviousPanel);
+  document.getElementById("wa-llm-mem-clear").addEventListener("click", clearContactMemory);
   document.getElementById("wa-llm-mem-cancel").addEventListener("click", goBackToPreviousPanel);
   document.getElementById("wa-llm-mem-save").addEventListener("click", saveMemory);
   setupPanelDragging();
@@ -404,6 +550,10 @@ function showPanel(state, content = "") {
     memFooter.style.display = "flex";
   } else if (state === "error") {
     body.innerHTML = `<div class="wa-llm-error">⚠ ${escapeHtml(content)}</div>`;
+  }
+  const inlineClearButton = document.getElementById("wa-llm-clear-memory-inline");
+  if (inlineClearButton) {
+    inlineClearButton.addEventListener("click", clearContactMemory);
   }
 }
 
@@ -493,11 +643,14 @@ function stopPanelDrag() {
 
 function renderMemoryRead(memory) {
   const contact = currentContactName;
+  const contextCount = currentChatHistory.length;
   if (!memory) {
     return `
       <div class="wa-mem-read">
         <div class="wa-mem-name">📇 ${escapeHtml(contact)}</div>
         <div class="wa-mem-empty">No memory yet.<br>Use Edit contact memory to save notes for this chat.</div>
+        <div class="wa-mem-row"><span class="wa-mem-label">Prompt Context</span><span>${contextCount} saved messages for this contact</span></div>
+        <button class="wa-btn wa-btn-secondary wa-mem-inline-btn" id="wa-llm-clear-memory-inline">Clear memory</button>
       </div>`;
   }
   const topics = (memory.topics || []).map((t) => `<span class="wa-mem-tag">${escapeHtml(t)}</span>`).join("");
@@ -514,6 +667,7 @@ function renderMemoryRead(memory) {
 function renderMemoryWrite(memory) {
   return `
     <div class="wa-mem-write">
+      <div class="wa-mem-row"><span class="wa-mem-label">Prompt Context</span><span>${currentChatHistory.length} saved messages for this contact</span></div>
       <div class="wa-mem-name">✏️ ${escapeHtml(currentContactName)}</div>
       <label class="wa-mem-label">Style</label>
       <input id="wa-mem-style" class="wa-mem-input" type="text" placeholder="e.g. casual, bahasa Indonesia, friendly" value="${escapeHtml(memory?.style || "")}" />
@@ -528,6 +682,8 @@ function renderMemoryWrite(memory) {
 
 async function readMemory() {
   currentContactName = getContactName();
+  await syncActiveContactContext(true);
+  console.log("[WA-LLM] Loading contact notes for", currentContactName);
   showPanel("memory-loading");
   try {
     const res = await fetch(`${MCP_SERVER}/memory/${encodeURIComponent(currentContactName)}`);
@@ -544,6 +700,8 @@ async function readMemory() {
 
 async function writeMemory() {
   currentContactName = getContactName();
+  await syncActiveContactContext(true);
+  console.log("[WA-LLM] Opening memory editor for", currentContactName);
   showPanel("memory-loading");
   try {
     // Pre-fill with existing memory if available
@@ -571,6 +729,27 @@ async function saveMemory() {
     showPanel("memory-read", data.contact);
   } catch (err) {
     showPanel("error", `Could not save memory: ${err.message}`);
+  }
+}
+
+async function clearContactMemory() {
+  currentContactName = getContactName();
+  if (!window.confirm(`Clear saved prompt context for ${currentContactName}?`)) {
+    return;
+  }
+
+  try {
+    await clearStoredChatHistory(currentContactName);
+    currentChatHistory = [];
+    lastProcessedSignature = null;
+    console.log("[WA-LLM] Prompt context cleared for", currentContactName);
+    if (panelMode === "memory-write") {
+      await writeMemory();
+    } else {
+      await readMemory();
+    }
+  } catch (err) {
+    showPanel("error", `Could not clear memory: ${err.message}`);
   }
 }
 

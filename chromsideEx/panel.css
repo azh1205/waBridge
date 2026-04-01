@@ -364,6 +364,10 @@
   border-top: 1px solid #2d2d4e;
 }
 
+.wa-mem-inline-btn {
+  margin-top: 8px;
+}
+
 /* ── Memory Write View ── */
 .wa-mem-write {
   display: flex;

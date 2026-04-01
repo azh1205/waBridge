@@ -22,8 +22,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 const MCP_SERVER = "http://localhost:3000";
+const SUGGESTION_TIMEOUT_MS = 12000;
+const SUGGESTION_RETRY_COUNT = 1;
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  console.log("[waBridge] Background message received:", msg?.type, {
+    tabId: sender?.tab?.id,
+    contactName: msg?.payload?.contactName,
+  });
   // Health check from content.js — must respond or the page will reload
   if (msg.type === "PING") {
     sendResponse({ ok: true });
@@ -56,18 +62,82 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-async function fetchSuggestion({ message, contactName, chatHistory, model, systemPrompt, imageDataUrl, latestImageKey, forceImageRefresh }) {
-  const response = await fetch(`${MCP_SERVER}/suggest`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, contactName, chatHistory, model, systemPrompt, imageDataUrl, latestImageKey, forceImageRefresh }),
-  });
+async function fetchSuggestion(payload) {
+  const requestBody = JSON.stringify(payload);
+  let lastError = null;
 
-  if (!response.ok) {
-    throw new Error(`MCP server error: ${response.status}`);
+  for (let attempt = 0; attempt <= SUGGESTION_RETRY_COUNT; attempt++) {
+    const attemptNumber = attempt + 1;
+
+    try {
+      console.log("[waBridge] Fetching suggestion", {
+        attempt: attemptNumber,
+        contactName: payload.contactName,
+        historyLength: Array.isArray(payload.chatHistory) ? payload.chatHistory.length : 0,
+      });
+
+      const response = await fetchWithTimeout(
+        `${MCP_SERVER}/suggest`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: requestBody,
+        },
+        SUGGESTION_TIMEOUT_MS
+      );
+
+      if (!response.ok) {
+        throw new Error(`MCP server error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      console.log("[waBridge] Suggestion fetch succeeded", {
+        attempt: attemptNumber,
+        contactName: payload.contactName,
+      });
+      return data.reply;
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === SUGGESTION_RETRY_COUNT || !isRetryableError(error)) {
+        break;
+      }
+    }
   }
 
-  const data = await response.json();
-  return data.reply;
+  throw new Error(getFriendlySuggestionError(lastError));
+}
 
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function isRetryableError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return error?.name === "AbortError" || message.includes("failed to fetch");
+}
+
+function getFriendlySuggestionError(error) {
+  if (!error) return "Server not reachable";
+
+  if (error.name === "AbortError") {
+    return "Server not reachable";
+  }
+
+  const message = String(error.message || "");
+  if (/failed to fetch/i.test(message)) {
+    return "Server not reachable";
+  }
+
+  return message;
 }
