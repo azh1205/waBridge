@@ -6,7 +6,7 @@ console.log("[WA-LLM] Content script successfully loaded. Waiting for WhatsApp U
 
 const MCP_SERVER = "http://localhost:3000";
 
-let settings = { keywords: [], model: "local-model", systemPrompt: "" };
+let settings = { keywords: [], model: "local-model", systemPrompt: "", autoSend: false, autoSendDelay: 5 };
 let lastProcessedSignature = null;
 let suggestionPanel = null;
 let isProcessing = false;
@@ -17,6 +17,7 @@ let previousPanelState = { mode: "idle", content: "" };
 let isMathPreviewOpen = false;
 let isPanelMinimized = false;
 let panelDragState = null;
+let autoSendTimer = null;
 
 // ─── Extension health check ───────────────────────────────────────────────────
 
@@ -48,6 +49,8 @@ async function init() {
   try {
     settings = await getSettings();
     settings.keywords = normalizeKeywords(settings.keywords);
+    settings.autoSend = Boolean(settings.autoSend);
+    settings.autoSendDelay = normalizeAutoSendDelay(settings.autoSendDelay);
     console.log("[WA-LLM] Settings loaded.", settings);
   } catch (err) {
     console.error("[WA-LLM] Failed to load settings, using defaults.", err);
@@ -55,6 +58,8 @@ async function init() {
       keywords: ["help", "support", "info", "halo", "hai"],
       model: "local-model",
       systemPrompt: "",
+      autoSend: false,
+      autoSendDelay: 5,
     };
     settings.keywords = normalizeKeywords(settings.keywords);
   }
@@ -80,6 +85,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (changes.keywords) settings.keywords = normalizeKeywords(changes.keywords.newValue);
   if (changes.model) settings.model = changes.model.newValue || "local-model";
   if (changes.systemPrompt) settings.systemPrompt = changes.systemPrompt.newValue || "";
+  if (changes.autoSend) settings.autoSend = Boolean(changes.autoSend.newValue);
+  if (changes.autoSendDelay) settings.autoSendDelay = normalizeAutoSendDelay(changes.autoSendDelay.newValue);
   console.log("[WA-LLM] Settings updated live:", settings);
 });
 
@@ -354,6 +361,7 @@ function injectPanel() {
 
 function showPanel(state, content = "") {
   if (!suggestionPanel) injectPanel();
+  clearAutoSendTimer();
   if (isMemoryState(state)) rememberPreviousPanel();
   panelMode = state;
   suggestionPanel.classList.remove("wa-llm-hidden");
@@ -385,6 +393,7 @@ function showPanel(state, content = "") {
     document.getElementById("wa-llm-text").addEventListener("input", updateSuggestionPreview);
     syncMathPreviewVisibility();
     footer.style.display = "flex";
+    scheduleAutoSend();
   } else if (state === "memory-loading") {
     body.innerHTML = `<div class="wa-llm-thinking"><span class="wa-dot"></span><span class="wa-dot"></span><span class="wa-dot"></span><span style="margin-left:8px">Loading memory...</span></div>`;
   } else if (state === "memory-read") {
@@ -567,10 +576,24 @@ async function saveMemory() {
 
 // ─── Suggestion Actions ───────────────────────────────────────────────────────
 
-function sendSuggestion() {
+async function sendSuggestion() {
+  clearAutoSendTimer();
+
   const text = getCurrentSuggestionText();
   if (!text) return;
-  injectTextIntoInput(text);
+
+  const injected = injectTextIntoInput(text);
+  if (!injected) {
+    showPanel("error", "Could not find the WhatsApp reply box.");
+    return;
+  }
+
+  const sent = await triggerWhatsAppSend();
+  if (!sent) {
+    showPanel("error", "Reply was inserted, but WhatsApp did not send it.");
+    return;
+  }
+
   document.getElementById("wa-llm-footer").style.display = "none";
   document.getElementById("wa-llm-body").innerHTML = `<div class="wa-llm-idle">✓ Sent! Waiting for next keyword...</div>`;
 }
@@ -589,12 +612,80 @@ function injectTextIntoInput(text) {
     document.querySelector('div[contenteditable="true"][data-tab="10"]') ||
     document.querySelector('div[contenteditable="true"][role="textbox"]');
 
-  if (!input) { console.error("[WA-LLM] Could not find message input box"); return; }
+  if (!input) {
+    console.error("[WA-LLM] Could not find message input box");
+    return false;
+  }
 
   input.focus();
   document.execCommand("selectAll", false, null);
   document.execCommand("insertText", false, text);
   input.dispatchEvent(new Event("input", { bubbles: true }));
+  return true;
+}
+
+function scheduleAutoSend() {
+  if (!settings.autoSend) return;
+
+  const delayMs = normalizeAutoSendDelay(settings.autoSendDelay) * 1000;
+  autoSendTimer = window.setTimeout(() => {
+    if (panelMode === "suggestion") {
+      void sendSuggestion();
+    }
+  }, delayMs);
+}
+
+function clearAutoSendTimer() {
+  if (!autoSendTimer) return;
+  window.clearTimeout(autoSendTimer);
+  autoSendTimer = null;
+}
+
+async function triggerWhatsAppSend() {
+  await wait(150);
+
+  const sendButton =
+    document.querySelector('[data-testid="compose-btn-send"]') ||
+    document.querySelector('button[aria-label="Send"]') ||
+    document.querySelector('span[data-icon="send"]')?.closest("button");
+
+  if (sendButton instanceof HTMLElement && !sendButton.disabled) {
+    sendButton.click();
+    return true;
+  }
+
+  const input =
+    document.querySelector('[data-testid="conversation-compose-box-input"]') ||
+    document.querySelector('div[contenteditable="true"][data-tab="10"]') ||
+    document.querySelector('div[contenteditable="true"][role="textbox"]');
+
+  if (!(input instanceof HTMLElement)) {
+    return false;
+  }
+
+  input.focus();
+  const keyboardOptions = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true };
+  input.dispatchEvent(new KeyboardEvent("keydown", keyboardOptions));
+  input.dispatchEvent(new KeyboardEvent("keypress", keyboardOptions));
+  input.dispatchEvent(new KeyboardEvent("keyup", keyboardOptions));
+
+  await wait(250);
+  return !isComposeBoxFilled(input);
+}
+
+function isComposeBoxFilled(input) {
+  const text = input.innerText || input.textContent || "";
+  return text.trim().length > 0;
+}
+
+function normalizeAutoSendDelay(value) {
+  const parsed = Number.parseInt(value, 10);
+  if (Number.isNaN(parsed)) return 5;
+  return Math.min(Math.max(parsed, 1), 60);
+}
+
+function wait(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 // ─── Utils ────────────────────────────────────────────────────────────────────

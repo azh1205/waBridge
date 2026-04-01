@@ -1,6 +1,13 @@
 // popup.js
 const MCP_SERVER = "http://localhost:3000";
 
+function syncAutoSendDelayState() {
+  const autoSend = document.getElementById("autoSend");
+  const delayInput = document.getElementById("autoSendDelay");
+  delayInput.disabled = !autoSend.checked;
+  delayInput.style.opacity = autoSend.checked ? "1" : "0.55";
+}
+
 async function checkServer() {
   const dot = document.getElementById("server-dot");
   const label = document.getElementById("server-label");
@@ -26,6 +33,7 @@ chrome.storage.sync.get(["keywords", "model", "systemPrompt", "autoSend", "autoS
   document.getElementById("systemPrompt").value = data.systemPrompt || "You are a helpful WhatsApp assistant. Reply concisely and naturally.";
   document.getElementById("autoSend").checked = data.autoSend || false;
   document.getElementById("autoSendDelay").value = data.autoSendDelay || 5;
+  syncAutoSendDelayState();
 });
 
 // Save settings
@@ -44,5 +52,7 @@ document.getElementById("save").addEventListener("click", () => {
     setTimeout(() => { status.className = "status"; }, 2000);
   });
 });
+
+document.getElementById("autoSend").addEventListener("change", syncAutoSendDelayState);
 
 checkServer();

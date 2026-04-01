@@ -38,11 +38,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "GET_SETTINGS") {
-    chrome.storage.sync.get(["keywords", "model", "systemPrompt"], (data) => {
+    chrome.storage.sync.get(["keywords", "model", "systemPrompt", "autoSend", "autoSendDelay"], (data) => {
       sendResponse({
         keywords: data.keywords || ["help", "support", "info", "halo", "hai"],
         model: data.model || "local-model",
         systemPrompt: data.systemPrompt || "You are a helpful WhatsApp assistant. Reply concisely and naturally.",
+        autoSend: data.autoSend || false,
+        autoSendDelay: data.autoSendDelay || 5,
       });
     });
     return true;
