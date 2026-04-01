@@ -54,11 +54,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-async function fetchSuggestion({ message, contactName, chatHistory, model, systemPrompt }) {
+async function fetchSuggestion({ message, contactName, chatHistory, model, systemPrompt, imageDataUrl, latestImageKey, forceImageRefresh }) {
   const response = await fetch(`${MCP_SERVER}/suggest`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, contactName, chatHistory, model, systemPrompt }),
+    body: JSON.stringify({ message, contactName, chatHistory, model, systemPrompt, imageDataUrl, latestImageKey, forceImageRefresh }),
   });
 
   if (!response.ok) {

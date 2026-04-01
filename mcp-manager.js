@@ -82,8 +82,10 @@ export class McpManager {
       type: "function",
       function: {
         name: t.name,
-        description: t.description,
-        parameters: t.inputSchema || { type: "object", properties: {} },
+        description: typeof t.description === "string" && t.description.trim()
+          ? t.description
+          : `Execute tool ${t.name}`,
+        parameters: normalizeToolSchema(t.inputSchema),
       },
     }));
   }
@@ -113,4 +115,99 @@ export class McpManager {
     }
     console.log("[MCPManager] All MCP servers stopped.");
   }
+}
+
+function normalizeToolSchema(schema) {
+  return normalizeSchemaNode(schema, "input");
+}
+
+function normalizeSchemaNode(schema, fieldName) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return {
+      type: "object",
+      description: `${fieldName} input`,
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    };
+  }
+
+  const type = typeof schema.type === "string" ? schema.type : inferSchemaType(schema);
+
+  if (type === "object") {
+    const rawProps =
+      schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
+        ? schema.properties
+        : {};
+
+    const properties = {};
+    for (const [key, value] of Object.entries(rawProps)) {
+      properties[key] = normalizeSchemaNode(value, key);
+    }
+
+    const required = Array.isArray(schema.required)
+      ? schema.required.filter((key) => typeof key === "string" && key in properties)
+      : [];
+
+    return {
+      type: "object",
+      description: typeof schema.description === "string" && schema.description.trim()
+        ? schema.description
+        : `${fieldName} object`,
+      properties,
+      required,
+      additionalProperties: false,
+    };
+  }
+
+  if (type === "array") {
+    return {
+      type: "array",
+      description: typeof schema.description === "string" && schema.description.trim()
+        ? schema.description
+        : `${fieldName} list`,
+      items: normalizeArrayItems(schema.items, fieldName),
+    };
+  }
+
+  const normalized = {
+    type: isPrimitiveType(type) ? type : "string",
+  };
+
+  if (typeof schema.description === "string" && schema.description.trim()) {
+    normalized.description = schema.description;
+  }
+
+  if (Array.isArray(schema.enum) && schema.enum.length) {
+    normalized.enum = schema.enum.filter((value) =>
+      ["string", "number", "integer", "boolean"].includes(typeof value) || value === null
+    );
+  }
+
+  return normalized;
+}
+
+function normalizeArrayItems(items, fieldName) {
+  if (!items || typeof items !== "object" || Array.isArray(items)) {
+    return {
+      type: "string",
+      description: `${fieldName} item`,
+    };
+  }
+
+  const normalized = normalizeSchemaNode(items, `${fieldName}_item`);
+  if (normalized.type === "object" && !("additionalProperties" in normalized)) {
+    normalized.additionalProperties = false;
+  }
+  return normalized;
+}
+
+function inferSchemaType(schema) {
+  if (schema.properties) return "object";
+  if (schema.items) return "array";
+  return "string";
+}
+
+function isPrimitiveType(type) {
+  return ["string", "number", "integer", "boolean", "null"].includes(type);
 }

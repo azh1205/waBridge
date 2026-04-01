@@ -1,4 +1,4 @@
-/* panel.css — Injected into WhatsApp Web */
+/* panel.css — Injected into WhatsApp Web — v2 with memory UI */
 
 #wa-llm-panel {
   position: fixed;
@@ -17,19 +17,31 @@
   transition: opacity 0.2s, transform 0.2s;
 }
 
+#wa-llm-panel.wa-llm-dragging {
+  transition: none;
+}
+
 #wa-llm-panel.wa-llm-hidden {
   opacity: 0;
   pointer-events: none;
   transform: translateY(10px);
 }
 
+#wa-llm-panel.wa-llm-minimized .wa-llm-body,
+#wa-llm-panel.wa-llm-minimized .wa-llm-footer {
+  display: none !important;
+}
+
+/* ── Header ── */
 .wa-llm-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 16px;
+  padding: 11px 14px;
   background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   border-bottom: 1px solid rgba(255,255,255,0.1);
+  cursor: move;
+  user-select: none;
 }
 
 .wa-llm-logo {
@@ -39,8 +51,30 @@
   color: #fff;
 }
 
+.wa-llm-header-btns {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.wa-llm-mem-btn {
+  background: rgba(255,255,255,0.18);
+  border: none;
+  color: #fff;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.wa-llm-mem-btn:hover { background: rgba(255,255,255,0.32); }
+
 .wa-llm-close {
-  background: rgba(255,255,255,0.2);
+  background: rgba(255,255,255,0.18);
   border: none;
   color: #fff;
   width: 24px;
@@ -51,14 +85,33 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  margin-left: 2px;
   transition: background 0.15s;
 }
 .wa-llm-close:hover { background: rgba(255,255,255,0.35); }
 
+.wa-llm-minimize {
+  background: rgba(255,255,255,0.18);
+  border: none;
+  color: #fff;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.wa-llm-minimize:hover { background: rgba(255,255,255,0.35); }
+
+/* ── Body ── */
 .wa-llm-body {
   padding: 14px 16px;
-  min-height: 70px;
-  max-height: 200px;
+  min-height: 80px;
+  max-height: 240px;
   overflow-y: auto;
 }
 
@@ -90,7 +143,7 @@
 
 @keyframes wa-pulse {
   0%, 100% { opacity: 0.3; transform: scale(0.8); }
-  50% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 1;   transform: scale(1);   }
 }
 
 .wa-llm-suggestion {
@@ -110,12 +163,251 @@
   box-shadow: 0 0 0 2px rgba(99,102,241,0.2);
 }
 
+.wa-llm-suggestion-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.wa-llm-math-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.wa-llm-math-hidden {
+  display: none;
+}
+
+.wa-llm-preview-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: #6366f1;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.wa-llm-math-preview {
+  background: #0f172a;
+  border: 1px solid #263247;
+  border-radius: 10px;
+  padding: 10px 12px;
+  color: #e2e8f0;
+  font-size: 14px;
+  line-height: 1.75;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.wa-llm-math-preview sup,
+.wa-llm-math-preview sub {
+  font-size: 0.78em;
+  line-height: 0;
+}
+
+.wa-frac {
+  display: inline-flex;
+  flex-direction: column;
+  vertical-align: middle;
+  align-items: center;
+  margin: 0 2px;
+}
+
+.wa-frac-top {
+  border-bottom: 1px solid rgba(226, 232, 240, 0.7);
+  padding: 0 4px 2px;
+  line-height: 1.15;
+}
+
+.wa-frac-bottom {
+  padding: 2px 4px 0;
+  line-height: 1.15;
+}
+
+.wa-sqrt {
+  display: inline-flex;
+  align-items: stretch;
+  vertical-align: middle;
+  margin: 0 2px;
+}
+
+.wa-sqrt-sign {
+  font-size: 1.25em;
+  line-height: 1;
+  padding-right: 2px;
+}
+
+.wa-sqrt-body {
+  border-top: 1px solid rgba(226, 232, 240, 0.7);
+  padding: 1px 4px 0;
+}
+
+.wa-op {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  vertical-align: middle;
+  margin: 0 3px;
+  min-width: 1.8em;
+}
+
+.wa-op-symbol {
+  font-size: 1.15em;
+  line-height: 1.1;
+}
+
+.wa-op-upper-wrap,
+.wa-op-lower-wrap {
+  min-height: 0.85em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wa-op-upper,
+.wa-op-lower {
+  font-size: 0.72em;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.wa-matrix {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px;
+  margin: 0 4px;
+  border-left: 2px solid rgba(165, 180, 252, 0.8);
+  border-right: 2px solid rgba(165, 180, 252, 0.8);
+  vertical-align: middle;
+}
+
+.wa-matrix-row {
+  display: inline-flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.wa-matrix-cell {
+  min-width: 1.5em;
+  text-align: center;
+}
+
 .wa-llm-error {
   color: #f87171;
   font-size: 13px;
   padding: 6px 0;
 }
 
+/* ── Memory Read View ── */
+.wa-mem-read {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wa-mem-name {
+  font-weight: 700;
+  font-size: 14px;
+  color: #a5b4fc;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #2d2d4e;
+  margin-bottom: 2px;
+}
+
+.wa-mem-empty {
+  color: #475569;
+  font-size: 12.5px;
+  text-align: center;
+  padding: 12px 0;
+  line-height: 1.6;
+}
+
+.wa-mem-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12.5px;
+  color: #cbd5e1;
+  line-height: 1.5;
+}
+
+.wa-mem-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: #6366f1;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.wa-mem-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.wa-mem-tag {
+  background: #2d2d4e;
+  color: #a5b4fc;
+  border-radius: 4px;
+  padding: 2px 7px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.wa-mem-meta {
+  font-size: 11px;
+  color: #475569;
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px solid #2d2d4e;
+}
+
+/* ── Memory Write View ── */
+.wa-mem-write {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wa-mem-input {
+  width: 100%;
+  background: #16213e;
+  border: 1px solid #2d2d4e;
+  border-radius: 7px;
+  padding: 6px 10px;
+  color: #e2e8f0;
+  font-size: 12.5px;
+  font-family: inherit;
+  outline: none;
+  box-sizing: border-box;
+}
+.wa-mem-input:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 2px rgba(99,102,241,0.15);
+}
+
+.wa-mem-textarea {
+  width: 100%;
+  background: #16213e;
+  border: 1px solid #2d2d4e;
+  border-radius: 7px;
+  padding: 6px 10px;
+  color: #e2e8f0;
+  font-size: 12.5px;
+  font-family: inherit;
+  outline: none;
+  resize: vertical;
+  min-height: 54px;
+  box-sizing: border-box;
+}
+.wa-mem-textarea:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 2px rgba(99,102,241,0.15);
+}
+
+/* ── Footers ── */
 .wa-llm-footer {
   display: flex;
   gap: 8px;
